@@ -7,9 +7,16 @@ model:
   base_url: ""            # leave empty for api.openai.com
   max_steps: 24          # hard cap on tool calls per investigation
 
+# USD per 1M tokens, from OpenAI's model pages on 2026-11-12. Update when
+# prices or the model change; a model missing here is logged with cost null.
+prices:
+  gpt-5.4:      {input: 2.50, cached_input: 0.25,  output: 15.00}
+  gpt-5.4-mini: {input: 0.75, cached_input: 0.075, output: 4.50}
+
 sources:
   prometheus: http://127.0.0.1:9090
   loki: http://127.0.0.1:3100
+  jenkins: http://127.0.0.1:8081   # login from JENKINS_USER / JENKINS_PASSWORD in .env (read-only user)
 
 slack:
   channel: "#alerts"
@@ -35,6 +42,8 @@ service_map:
         depends_on: [mongodb, redis]
         logs: '{service="orders-api"}'
         metrics_job: orders-api
+        deploy_job: deploy-orders-api        # Jenkins job that deploys it
+        repo: orders-api1/orders-api         # Bitbucket workspace/repo
       mongodb:
         role: Database for orders-api. Database name "shop".
         data_disk: /mnt/mongo-data
@@ -43,6 +52,10 @@ service_map:
       redis:
         role: Cache and runtime settings for orders-api.
         logs: '{service="redis"}'
+      backup:
+        role: Scheduled dump of the shop database. Writes to /mnt/mongo-data/backups and keeps only the latest dump.
+        depends_on: [mongodb]
+        logs: '{service="backup"}'
       loadgen:
         role: Synthetic traffic. Posts orders through nginx all day.
         logs: '{service="loadgen"}'

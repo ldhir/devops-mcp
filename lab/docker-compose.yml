@@ -14,11 +14,20 @@ services:
     restart: unless-stopped
 
   orders-api:
+    image: lab-orders-api:current      # Jenkins rebuilds this tag on every deploy
     build: ./app
     environment:
       MONGO_URL: mongodb://mongodb:27017
       REDIS_URL: redis://redis:6379
     depends_on: [mongodb, redis]
+    restart: unless-stopped
+
+  backup:
+    build: ./app
+    command: ["python", "backup.py"]
+    volumes:
+      - /mnt/mongo-data:/data
+    depends_on: [mongodb]
     restart: unless-stopped
 
   nginx:
@@ -92,7 +101,23 @@ services:
     depends_on: [prometheus, loki]
     restart: unless-stopped
 
+  jenkins:
+    build: ./jenkins
+    user: root
+    environment:
+      JENKINS_ADMIN_PASSWORD: ${JENKINS_ADMIN_PASSWORD}
+      JENKINS_AGENT_PASSWORD: ${JENKINS_AGENT_PASSWORD}
+      BITBUCKET_TOKEN: ${BITBUCKET_TOKEN:-unset}
+    volumes:
+      - ./jenkins/jenkins.yaml:/var/jenkins_casc/jenkins.yaml:ro
+      - jenkins-home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/ubuntu/lab:/home/ubuntu/lab      # same path as the host, so compose resolves files identically
+    ports: ["127.0.0.1:8081:8080"]
+    restart: unless-stopped
+
 volumes:
+  jenkins-home:
   prometheus-data:
   loki-data:
   grafana-data:

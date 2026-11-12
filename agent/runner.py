@@ -46,7 +46,9 @@ How to investigate:
 - Confirm the symptom with numbers, then find what exactly is growing or failing, as narrowly as \
 the data allows (which database, which collection, which process).
 - Find when it started. Look at the trend over a long enough window to see the change point.
-- Find what changed at that time: look at logs from the services involved around the start time, \
+- Find what changed at that time. Use what_changed on the affected service and on the services \
+around it. A deploy shortly before the start is a suspect, not proof: read its diff and check that \
+the errors match the code that changed. Then look at logs from the services involved around the start time, \
 especially warnings, errors, config changes, restarts and deploys. Routine request lines are noise; \
 filter them out.
 - The host may have had earlier, unrelated incidents. Anchor on this alert: find the most recent \
@@ -64,10 +66,49 @@ asterisks, `code` with backticks, no # headings, no tables. Use exactly these la
 *Started:* UTC time the problem began, and how fast it is moving
 *Root cause:* one or two sentences
 *Evidence:* 2-4 bullets, each with a number or a quoted log line and its time
-*Proposed fix:* concrete steps, immediate first, then cleanup; mention any risk
+*Proposed fix:* concrete steps, immediate first, then cleanup; mention any risk. If a deploy \
+caused it, name the commit to roll back to
 *Confidence:* high / medium / low, plus anything you could not verify
 
 Keep it under 220 words. Times in UTC."""
+
+
+def cost_usd(usage: dict, model: str) -> float | None:
+    """Dollar cost of one investigation from the price table in config.yaml."""
+    price = (CONFIG.get("prices") or {}).get(model)
+    if not price:
+        return None
+    fresh = usage["input_tokens"] - usage["cached_input_tokens"]
+    return round((fresh * price["input"] + usage["cached_input_tokens"] * price["cached_input"]
+                  + usage["output_tokens"] * price["output"]) / 1e6, 4)
+
+
+RECORD_PROMPT = """Now restate your conclusion as one JSON object and nothing else, with exactly these keys:
+"affected_service": the single service at the centre of the problem, as named in the service map,
+"started_at_utc": when the problem began, as "YYYY-MM-DDTHH:MM:SSZ", or null if unknown,
+"root_cause": one sentence,
+"proposed_fix": one sentence,
+"cause_determined": true if the evidence shows the cause, false if you could not determine it,
+"confidence": "high", "medium" or "low"."""
+
+
+def load_override() -> dict:
+    """Optional per-run settings written by the eval harness (model, disabled tools, run id)."""
+    path = HERE / "override.json"
+    try:
+        return json.loads(path.read_text()) if path.exists() else {}
+    except Exception:
+        return {}
+
+
+def add_usage(usage: dict, resp) -> None:
+    if not resp.usage:
+        return
+    usage["llm_calls"] += 1
+    usage["input_tokens"] += resp.usage.prompt_tokens or 0
+    usage["output_tokens"] += resp.usage.completion_tokens or 0
+    details = getattr(resp.usage, "prompt_tokens_details", None)
+    usage["cached_input_tokens"] += (getattr(details, "cached_tokens", 0) or 0) if details else 0
 
 
 def describe(alert: dict) -> str:
@@ -89,12 +130,18 @@ def describe(alert: dict) -> str:
 
 def investigate(alert: dict) -> None:
     name = alert.get("labels", {}).get("alertname", "alert")
-    try:
-        root = post_update(describe(alert))
-        thread = root["ts"]
-    except Exception:
-        log.exception("could not post alert to Slack")
-        return
+    over = load_override()
+    model = over.get("model") or MODEL["name"]
+    disabled = set(over.get("disabled_tools") or [])
+    quiet = bool(over.get("quiet"))  # eval runs do not post to Slack
+    tools = [t for t in AGENT_TOOLS if t["function"]["name"] not in disabled]
+    thread = ""
+    if not quiet:
+        try:
+            thread = post_update(describe(alert))["ts"]
+        except Exception:
+            log.exception("could not post alert to Slack")
+            return
     try:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         messages = [
@@ -106,22 +153,22 @@ def investigate(alert: dict) -> None:
             },
         ]
         steps = 0
-        while True:
+        started = time.time()
+        usage = {"llm_calls": 0, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        transcript = []
+        final = None
+        while final is None:
             force_answer = steps >= MODEL["max_steps"]
             resp = client.chat.completions.create(
-                model=MODEL["name"],
-                messages=messages,
-                tools=AGENT_TOOLS,
+                model=model, messages=messages, tools=tools,
                 tool_choice="none" if force_answer else "auto",
             )
             msg = resp.choices[0].message
+            add_usage(usage, resp)
             if not msg.tool_calls:
                 final = redact(msg.content or "(no findings returned)")
-                post_update(final, thread_ts=thread)
-                with (HERE / "writeups.jsonl").open("a") as f:
-                    f.write(json.dumps({"ts": now, "alert": name, "tool_calls": steps, "text": final}) + "\n")
-                log.info("%s: write-up posted after %d tool calls", name, steps)
-                return
+                messages.append({"role": "assistant", "content": final})
+                break
             messages.append(msg.model_dump(exclude_none=True))
             for tc in msg.tool_calls:
                 steps += 1
@@ -134,19 +181,48 @@ def investigate(alert: dict) -> None:
                 except json.JSONDecodeError:
                     args = {}
                 log.info("%s: step %d %s %s", name, steps, tc.function.name, json.dumps(args)[:200])
-                result = call_tool(tc.function.name, args, caller="runner") if tc.function.name != "post_update" \
-                    else json.dumps({"error": "not available to the investigator"})
+                if tc.function.name == "post_update" or tc.function.name in disabled:
+                    result = json.dumps({"error": "not available to the investigator"})
+                else:
+                    result = call_tool(tc.function.name, args, caller="runner")
+                transcript.append({"tool": tc.function.name, "args": args, "result": result})
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-            if force_answer:
-                # tool_choice none should prevent this; stop rather than loop
-                post_update("Investigation hit its step limit without a conclusion.", thread_ts=thread)
-                return
+
+        seconds = round(time.time() - started, 1)  # alert to write-up; excludes the record step below
+
+        # A small structured copy of the conclusion, so code can grade it.
+        record = None
+        try:
+            messages.append({"role": "user", "content": RECORD_PROMPT})
+            resp = client.chat.completions.create(
+                model=model, messages=messages, response_format={"type": "json_object"})
+            add_usage(usage, resp)
+            record = json.loads(redact(resp.choices[0].message.content or "{}"))
+        except Exception:
+            log.exception("could not build structured record")
+
+        cost = cost_usd(usage, model)
+        if not quiet:
+            footer = f"_{steps} tool calls · {seconds:.0f}s · {usage['input_tokens'] + usage['output_tokens']:,} tokens"
+            footer += f" · ${cost:.2f} · {model}_" if cost is not None else f" · {model}_"
+            post_update(final + "\n\n" + footer, thread_ts=thread)
+        run_id = over.get("run_id") or f"live-{int(started)}"
+        (HERE / "transcripts").mkdir(exist_ok=True)
+        (HERE / "transcripts" / f"{run_id}.json").write_text(json.dumps(transcript))
+        with (HERE / "writeups.jsonl").open("a") as f:
+            f.write(json.dumps({
+                "ts": now, "run_id": run_id, "alert": name, "labels": alert.get("labels", {}),
+                "alert_started": alert.get("startsAt"), "model": model,
+                "disabled_tools": sorted(disabled), "tool_calls": steps, "seconds": seconds,
+                **usage, "cost_usd": cost, "record": record, "text": final}) + "\n")
+        log.info("%s: write-up done after %d tool calls, %ss, cost %s", name, steps, seconds, cost)
     except Exception as exc:
         log.exception("investigation failed")
-        try:
-            post_update(f":warning: Investigation failed: `{type(exc).__name__}`. See runner logs.", thread_ts=thread)
-        except Exception:
-            pass
+        if not quiet:
+            try:
+                post_update(f":warning: Investigation failed: `{type(exc).__name__}`. See runner logs.", thread_ts=thread)
+            except Exception:
+                pass
 
 
 app = FastAPI()

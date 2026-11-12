@@ -20,6 +20,8 @@ cache = redis.Redis.from_url(os.environ["REDIS_URL"])
 
 REQS = Counter("orders_requests_total", "Order requests", ["outcome"])
 DEBUG_ON = Gauge("orders_debug_capture_enabled", "1 when debug payload capture is on")
+VERSION = os.environ.get("APP_VERSION", "dev")   # git commit, set by the Jenkins build
+Gauge("orders_build_info", "Running build; the version label is the git commit", ["version"]).labels(VERSION).set(1)
 app = FastAPI()
 
 
@@ -33,6 +35,11 @@ def debug_capture() -> bool:
         return cache.get("debug_capture") == b"1"
     except Exception:
         return False
+
+
+@app.on_event("startup")
+def started():
+    emit(logging.INFO, "service_started", version=VERSION)
 
 
 @app.post("/orders")

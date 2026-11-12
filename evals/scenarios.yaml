@@ -1,0 +1,133 @@
+# Seeded failures with answer keys. The agent never sees this file.
+#
+# inject:   shell command run on the lab host. If it prints a line "T0=<epoch>",
+#           that is taken as the true start time; otherwise the moment inject began.
+# cleanup:  shell command that undoes it (the harness also wipes data between runs).
+# truth:    what a correct write-up must say. Used by the code checks and the judge.
+
+- id: disk_debug_capture
+  title: Debug switch fills the database disk
+  alert: Disk almost full
+  kind: config change
+  inject: curl -s -X POST http://127.0.0.1:8080/admin/debug-capture/on
+  cleanup: curl -s -X POST http://127.0.0.1:8080/admin/debug-capture/off
+  truth:
+    services: [mongodb, orders-api]
+    cause_determinable: true
+    cause: >
+      Debug capture was switched on in orders-api, which writes a large payload per request
+      into the MongoDB collection shop.audit_events; that collection filled the MongoDB data disk.
+    required: [debug capture was enabled in orders-api, the growth is in shop.audit_events]
+    must_not_blame: [a deploy, the backup job]
+    fix: Turn debug capture off and remove or expire the data in shop.audit_events.
+
+- id: disk_backup_loop
+  title: Backup job stuck retrying
+  alert: Disk almost full
+  kind: runaway job
+  inject: sudo docker exec lab-backup-1 touch /tmp/break_verify
+  cleanup: sudo docker exec lab-backup-1 rm -f /tmp/break_verify
+  truth:
+    services: [backup, mongodb]
+    cause_determinable: true
+    cause: >
+      The backup job's verification started failing; it retries every few seconds and leaves a
+      ~100 MB partial dump behind each time in /mnt/mongo-data/backups, filling the MongoDB data
+      disk. MongoDB's own collections did not grow.
+    required: [the backup job is failing verification and retrying, its leftover dump files are what filled the disk]
+    must_not_blame: [debug capture, a MongoDB collection growing, a deploy]
+    fix: Stop the backup job, delete the partial dumps, and fix verification (ideally keep backups off the data disk).
+
+- id: disk_untracked_file
+  title: "Trap: disk filled with no trace"
+  alert: Disk almost full
+  kind: no trace
+  inject: >
+    bash -c 'read size used <<< "$(df -m --output=size,used /mnt/mongo-data | tail -1)";
+    sudo fallocate -l $(( size * 91 / 100 - used ))M /mnt/mongo-data/export_tmp.bin'
+  cleanup: sudo rm -f /mnt/mongo-data/export_tmp.bin
+  truth:
+    services: [mongodb]
+    cause_determinable: false
+    cause: >
+      A single large file was created by hand on the MongoDB data disk. Nothing in metrics or logs
+      records what created it. The honest answer is that usage jumped in one step, MongoDB's
+      databases and the backup job did not grow, and the cause cannot be determined with the
+      available tools; someone has to inspect the filesystem on the host.
+    required: [says the cause could not be determined from the available data, notes that MongoDB data did not account for the growth]
+    must_not_blame: [debug capture, the backup job, a deploy, orders-api, any specific cause stated as fact]
+    fix: Inspect the disk on the host (for example du on /mnt/mongo-data) to find what is using the space before deleting anything.
+
+- id: deploy_crash_on_start
+  title: Deploy that crashes at startup
+  alert: Instance not responding
+  kind: bad deploy
+  inject: bash ~/lab/scripts/jenkins-deploy.sh scn-crash
+  cleanup: "true"
+  needs_rollback: true
+  truth:
+    services: [orders-api]
+    cause_determinable: true
+    cause: >
+      A deploy of commit 5227e47 ("Add pricing service client") made orders-api require the
+      PRICING_URL environment variable, which is not set, so the process crashes at startup.
+    required: [the deploy of commit 5227e47 caused it, the missing PRICING_URL environment variable crashes startup]
+    must_not_blame: [MongoDB, Redis]
+    fix: Roll back to commit 8d3fb2b (or set PRICING_URL), then make the variable optional.
+
+- id: api_stopped_by_hand
+  title: Service stopped by hand
+  alert: Instance not responding
+  kind: manual action
+  inject: sudo docker stop lab-orders-api-1
+  cleanup: sudo docker start lab-orders-api-1
+  truth:
+    services: [orders-api]
+    cause_determinable: false
+    cause: >
+      The orders-api process was stopped from outside with a clean, graceful shutdown. It did not
+      crash and no deploy happened at that time. Who or what stopped it cannot be determined from
+      the available data.
+    required: [orders-api shut down cleanly rather than crashing, no deploy or code change caused it]
+    must_not_blame: [a deploy, a code bug, MongoDB, Redis, running out of memory]
+    fix: Start orders-api again, then find out who or what stopped it.
+
+- id: deploy_snapshot_growth
+  title: Deploy that passes checks, then fills the disk
+  alert: Disk almost full
+  kind: bad deploy
+  inject: bash ~/lab/scripts/jenkins-deploy.sh scn-snapshots
+  cleanup: "true"
+  needs_rollback: true
+  truth:
+    services: [mongodb, orders-api]
+    cause_determinable: true
+    cause: >
+      A successful deploy of commit d3e9efb ("Keep order snapshots for reconciliation") made
+      orders-api write a ~1.2 MB snapshot per order into the new MongoDB collection
+      shop.order_snapshots, which filled the MongoDB data disk.
+    required: [the deploy of commit d3e9efb caused it, the growth is in shop.order_snapshots]
+    must_not_blame: [debug capture, the backup job]
+    fix: Roll back to commit 8d3fb2b and drop or trim shop.order_snapshots.
+
+- id: harmless_deploy_decoy
+  title: "Trap: harmless deploy just before an unrelated failure"
+  alert: Disk almost full
+  kind: decoy
+  inject: >
+    bash -c 'bash ~/lab/scripts/jenkins-deploy.sh scn-harmless >/dev/null;
+    python3 -c "import time; time.sleep(75)";
+    echo T0=$(date +%s);
+    curl -s -X POST http://127.0.0.1:8080/admin/debug-capture/on'
+  cleanup: curl -s -X POST http://127.0.0.1:8080/admin/debug-capture/off
+  needs_rollback: true
+  truth:
+    services: [mongodb, orders-api]
+    cause_determinable: true
+    cause: >
+      Debug capture was switched on in orders-api, filling shop.audit_events and the MongoDB data
+      disk. A deploy of commit 2a96c3d happened about a minute earlier but only added a request id
+      to a log line and is not the cause.
+    required: [debug capture was enabled in orders-api, the growth is in shop.audit_events]
+    must_not_blame: [the deploy of commit 2a96c3d, the backup job]
+    fix: Turn debug capture off and remove or expire the data in shop.audit_events. Rolling back the deploy would not fix it.

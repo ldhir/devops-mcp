@@ -1,0 +1,78 @@
+# Jenkins configuration as code. Passwords and the Bitbucket token come from lab/.env.
+jenkins:
+  systemMessage: "Lab Jenkins. One job: deploy-orders-api."
+  numExecutors: 1
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          password: "${JENKINS_ADMIN_PASSWORD}"
+        - id: agent            # the alert agent's login: can read jobs and builds, nothing else
+          password: "${JENKINS_AGENT_PASSWORD}"
+  authorizationStrategy:
+    projectMatrix:
+      entries:
+        - user:
+            name: admin
+            permissions: ["Overall/Administer"]
+        - user:
+            name: agent
+            permissions: ["Overall/Read", "Job/Read"]
+
+security:
+  globalJobDslSecurityConfiguration:
+    useScriptSecurity: false
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: bitbucket
+              description: Bitbucket repository access token
+              username: x-token-auth
+              password: "${BITBUCKET_TOKEN}"
+
+jobs:
+  - script: |
+      pipelineJob('deploy-orders-api') {
+        description('Builds orders-api from Bitbucket and restarts it on lab-host-1.')
+        parameters {
+          stringParam('REF', 'main', 'Branch, tag or commit to deploy')
+        }
+        definition {
+          cps {
+            sandbox(true)
+            script('''
+      pipeline {
+        agent any
+        options { disableConcurrentBuilds() }
+        stages {
+          stage('Checkout') {
+            steps {
+              checkout([$class: 'GitSCM', branches: [[name: params.REF]],
+                userRemoteConfigs: [[url: 'https://bitbucket.org/orders-api1/orders-api.git', credentialsId: 'bitbucket']]])
+              script {
+                env.SHA = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                env.SUBJECT = sh(returnStdout: true, script: 'git log -1 --pretty=%s').trim()
+                currentBuild.description = env.SHA + ' ' + env.SUBJECT
+              }
+            }
+          }
+          stage('Build') {
+            steps { sh 'docker build --build-arg GIT_SHA=$SHA -t lab-orders-api:$SHA -t lab-orders-api:current .' }
+          }
+          stage('Deploy') {
+            steps { sh 'cd /home/ubuntu/lab && docker compose -p lab up -d --no-build --force-recreate orders-api' }
+          }
+          stage('Verify') {
+            steps { sh 'for i in $(seq 1 20); do curl -fs http://orders-api:8000/health && exit 0; sleep 2; done; echo health check failed; exit 1' }
+          }
+        }
+      }
+      ''')
+          }
+        }
+      }

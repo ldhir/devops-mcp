@@ -21,6 +21,7 @@ HERE = Path(__file__).parent
 CONFIG = yaml.safe_load((HERE / "config.yaml").read_text())
 PROM = CONFIG["sources"]["prometheus"]
 LOKI = CONFIG["sources"]["loki"]
+JENKINS = CONFIG["sources"].get("jenkins", "")
 AUDIT_PATH = HERE / CONFIG.get("audit_log", "audit.jsonl")
 MAX_RESULT_CHARS = 7000
 
@@ -218,8 +219,26 @@ def log_summary(service: str, minutes_back: int = 60) -> dict:
             if k["level"]:
                 q += f' | level={json.dumps(k["level"])}'
             k["first_seen"] = first_line(q)
-        return {"service": service, "window_minutes": minutes_back, "format": "json",
-                "kinds_rarest_first": kinds[:30]}
+        out = {"service": service, "window_minutes": minutes_back, "format": "json",
+               "kinds_rarest_first": kinds[:30]}
+        # Lines that are not JSON (stack traces, startup errors) would be invisible above.
+        plain = loki("/loki/api/v1/query_range", {
+            "query": selector + ' | json | __error__!=""', "limit": 400, "direction": "backward",
+            "start": int((end - minutes_back * 60) * 1e9), "end": int(end * 1e9)})
+        shapes: dict[str, dict] = {}
+        for stream in plain:
+            for ts, line in stream["values"]:
+                shape = _VARIABLE.sub("#", line)[:160]
+                s = shapes.setdefault(shape, {"count": 0, "first_ts": int(ts), "sample": line[:300]})
+                s["count"] += 1
+                if int(ts) < s["first_ts"]:
+                    s["first_ts"], s["sample"] = int(ts), line[:300]
+        if shapes:
+            top = sorted(shapes.values(), key=lambda s: -s["count"])[:12]
+            out["non_json_lines"] = {
+                "note": "unstructured lines such as stack traces; newest 400 sampled, most frequent first",
+                "kinds": [{"count": s["count"], "first_seen": f'{_iso(s["first_ts"] / 1e9)} {s["sample"]}'} for s in top]}
+        return out
 
     # Plain-text logs: mask numbers and ids, then count the resulting shapes.
     res = loki("/loki/api/v1/query_range", {
@@ -289,6 +308,111 @@ def get_logs(
     }
 
 
+def _service_entry(service: str) -> dict:
+    for host in CONFIG["service_map"].values():
+        if service in host.get("services", {}):
+            return host["services"][service]
+    raise ValueError(f"unknown service '{service}'; see service_map")
+
+
+def list_deploys(service: str, hours_back: int = 24) -> dict:
+    """Deploy history for a service, from its Jenkins job. Newest first."""
+    job = _service_entry(service).get("deploy_job")
+    if not job:
+        return {"service": service, "note": "no deploy job is recorded for this service; it is not deployed through Jenkins"}
+    r = httpx.get(
+        f"{JENKINS}/job/{job}/api/json",
+        params={"tree": "builds[number,result,building,timestamp,duration,description,actions[parameters[name,value]]]{0,40}"},
+        auth=(os.environ["JENKINS_USER"], os.environ["JENKINS_PASSWORD"]),
+        timeout=20,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Jenkins error {r.status_code}")
+    cutoff = time.time() - hours_back * 3600
+    inside, before = [], None
+    for b in r.json().get("builds", []):
+        started = b["timestamp"] / 1000
+        desc = (b.get("description") or "").split(" ", 1)
+        ref = next((p["value"] for a in b.get("actions", []) for p in a.get("parameters", []) if p.get("name") == "REF"), "")
+        row = {
+            "build": b["number"],
+            "started_utc": _iso(started),
+            "finished_utc": _iso(started + b.get("duration", 0) / 1000) if not b.get("building") else None,
+            "result": "RUNNING" if b.get("building") else b.get("result"),
+            "commit": desc[0] if desc[0] else None,
+            "commit_subject": desc[1] if len(desc) > 1 else None,
+            "requested_ref": ref,
+        }
+        if started >= cutoff:
+            inside.append(row)
+        elif before is None:
+            before = row
+    return {"service": service, "job": job, "window_hours": hours_back,
+            "deploys_newest_first": inside, "last_deploy_before_window": before}
+
+
+def get_diff(service: str, commit: str, base: str = "") -> dict:
+    """What a commit changed (or everything between base and commit), from Bitbucket."""
+    repo = _service_entry(service).get("repo")
+    if not repo:
+        raise ValueError(f"no repository is recorded for service '{service}'")
+    api = f"https://api.bitbucket.org/2.0/repositories/{repo}"
+    headers = {"Authorization": f"Bearer {os.environ['BITBUCKET_TOKEN']}"}
+    spec = f"{commit}..{base}" if base else commit
+    meta = httpx.get(f"{api}/commit/{commit}", headers=headers, timeout=20)
+    if meta.status_code != 200:
+        raise RuntimeError(f"Bitbucket error {meta.status_code} for commit {commit}")
+    m = meta.json()
+    diff = httpx.get(f"{api}/diff/{spec}", headers=headers, timeout=30, follow_redirects=True)
+    if diff.status_code != 200:
+        raise RuntimeError(f"Bitbucket error {diff.status_code} for diff {spec}")
+    text = diff.text
+    return {
+        "service": service, "repo": repo, "commit": m["hash"][:7], "compared_to": base or "its parent",
+        "date_utc": m.get("date"), "author": (m.get("author") or {}).get("user", {}).get("display_name")
+        or (m.get("author") or {}).get("raw"), "message": (m.get("message") or "").strip(),
+        "diff": text[:5000], "diff_truncated": len(text) > 5000,
+    }
+
+
+def what_changed(service: str, minutes_back: int = 120) -> dict:
+    """Everything that changed for one service in a window: deploys, restarts, new kinds of log line."""
+    entry = _service_entry(service)
+    out: dict = {"service": service, "window_minutes": minutes_back, "now_utc": _iso(time.time()),
+                 "depends_on": entry.get("depends_on", [])}
+    try:
+        d = list_deploys(service, hours_back=max(1, -(-minutes_back // 60)))
+        cutoff = time.time() - minutes_back * 60
+        if "deploys_newest_first" in d:
+            out["deploys"] = [x for x in d["deploys_newest_first"]
+                              if datetime.strptime(x["started_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() >= cutoff]
+            older = [x for x in d["deploys_newest_first"] if x not in out["deploys"]]
+            out["last_deploy_before_window"] = older[0] if older else d.get("last_deploy_before_window")
+        else:
+            out["deploys"] = d.get("note")
+    except Exception as exc:
+        out["deploys"] = f"unavailable: {exc}"
+    job = entry.get("metrics_job")
+    if job:
+        try:
+            out["scrape_target_up"] = query_metrics(f'up{{job="{job}"}}', minutes_back).get("series", [])
+            out["running_version_over_window"] = [
+                {"version": s["labels"].get("version"), "first_seen": s["first"][0], "last_seen": s["last"][0]}
+                for s in query_metrics(f'orders_build_info{{job="{job}"}}', minutes_back).get("series", [])
+            ] if service == "orders-api" else None
+            out["process_restarts"] = _instant(f'changes(process_start_time_seconds{{job="{job}"}}[{minutes_back}m])')
+        except Exception as exc:
+            out["metrics"] = f"unavailable: {exc}"
+        for key in ("scrape_target_up",):
+            for s in out.get(key) or []:
+                s.pop("points", None)
+    try:
+        out["log_kinds_rarest_first"] = log_summary(service, minutes_back).get("kinds_rarest_first", [])[:8]
+    except Exception as exc:
+        out["log_kinds_rarest_first"] = f"unavailable: {exc}"
+    return out
+
+
 def post_update(text: str, thread_ts: str = "") -> dict:
     """Post a message to the configured Slack channel. The only tool that writes anywhere."""
     payload = {"channel": CONFIG["slack"]["channel"], "text": text, "unfurl_links": False}
@@ -335,6 +459,21 @@ TOOLS: dict[str, dict] = {
         "fn": query_metrics,
         "description": "Run a PromQL query. minutes_back=0 returns current values. minutes_back>0 returns the trend over that window per series (first, last, min, max and sampled points with UTC times), which is how you find when something started changing.",
         "parameters": _schema({"promql": _S, "minutes_back": {**_I, "description": "0 for now, or window size in minutes"}}, ["promql"]),
+    },
+    "what_changed": {
+        "fn": what_changed,
+        "description": "Everything that changed for one service in a time window, in one call: deploys (from Jenkins), restarts, whether its scrape target was up, which version was running, and the rarest kinds of log line with their first occurrence. Call this early for the affected service and for the services it depends on or that depend on it.",
+        "parameters": _schema({"service": _S, "minutes_back": _I}, ["service"]),
+    },
+    "list_deploys": {
+        "fn": list_deploys,
+        "description": "Deploy history for a service from its Jenkins job, newest first: build number, start and finish time (UTC), result, commit and commit subject. Also returns the last deploy before the window, which is the version to roll back to.",
+        "parameters": _schema({"service": _S, "hours_back": _I}, ["service"]),
+    },
+    "get_diff": {
+        "fn": get_diff,
+        "description": "What a commit changed, from Bitbucket: message, author, date and the code diff. Pass 'base' (an older commit) to see everything between two deployed versions. A deploy near the start of a problem is a suspect; the diff is how you confirm or clear it.",
+        "parameters": _schema({"service": _S, "commit": _S, "base": {**_S, "description": "optional older commit to compare against"}}, ["service", "commit"]),
     },
     "log_summary": {
         "fn": log_summary,
