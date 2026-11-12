@@ -1,0 +1,13 @@
+[Unit]
+Description=DevOps MCP alert runner
+After=network-online.target docker.service
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/agent
+ExecStart=/home/ubuntu/agent/.venv/bin/uvicorn runner:app --host 0.0.0.0 --port 8088
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

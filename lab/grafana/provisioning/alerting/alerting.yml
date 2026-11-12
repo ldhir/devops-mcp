@@ -1,0 +1,74 @@
+# Generic infrastructure alerts only, like many teams have: symptoms, no cause.
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: alert-runner
+    receivers:
+      - uid: alert_runner_webhook
+        type: webhook
+        settings:
+          url: http://host.docker.internal:8088/alert
+          httpMethod: POST
+policies:
+  - orgId: 1
+    receiver: alert-runner
+    group_by: [alertname, instance, mountpoint]
+    group_wait: 10s
+    group_interval: 30s   # short, so a resolved alert is flushed before a lab re-run fires it again
+    repeat_interval: 4h
+groups:
+  - orgId: 1
+    name: infra
+    folder: Infra
+    interval: 30s
+    rules:
+      - uid: disk_almost_full
+        title: Disk almost full
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: OK
+        labels: {severity: critical}
+        annotations:
+          summary: 'Disk {{ $labels.mountpoint }} on {{ $labels.instance }} is over 85% full'
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: '100 * (1 - node_filesystem_avail_bytes{fstype=~"ext4|xfs"} / node_filesystem_size_bytes{fstype=~"ext4|xfs"})'
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [85]}
+      - uid: instance_down
+        title: Instance not responding
+        condition: C
+        for: 1m
+        noDataState: Alerting
+        execErrState: OK
+        labels: {severity: critical}
+        annotations:
+          summary: 'Target {{ $labels.job }} on {{ $labels.instance }} is not responding'
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'up'
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}

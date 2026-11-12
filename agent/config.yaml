@@ -1,0 +1,51 @@
+# Settings for the MCP server and the alert runner.
+# Secrets (OPENAI_API_KEY, SLACK_BOT_TOKEN) stay in .env, never here.
+
+model:
+  provider: openai        # only "openai" is implemented so far
+  name: gpt-5.4
+  base_url: ""            # leave empty for api.openai.com
+  max_steps: 24          # hard cap on tool calls per investigation
+
+sources:
+  prometheus: http://127.0.0.1:9090
+  loki: http://127.0.0.1:3100
+
+slack:
+  channel: "#alerts"
+
+runner:
+  port: 8088
+  dedupe_minutes: 30      # ignore repeat notifications for the same alert
+
+audit_log: audit.jsonl
+
+# Which service runs where. Hand-written for the lab; in a real deployment this is
+# rewritten for their hosts (and later derived from Prometheus labels).
+service_map:
+  lab-host-1:
+    description: Single lab VM. Everything runs in Docker on this host.
+    services:
+      nginx:
+        role: Front door. Proxies all HTTP traffic to orders-api.
+        depends_on: [orders-api]
+        logs: '{service="nginx"}'
+      orders-api:
+        role: FastAPI app. Takes orders and writes them to MongoDB.
+        depends_on: [mongodb, redis]
+        logs: '{service="orders-api"}'
+        metrics_job: orders-api
+      mongodb:
+        role: Database for orders-api. Database name "shop".
+        data_disk: /mnt/mongo-data
+        logs: '{service="mongodb"}'
+        metrics_job: mongodb
+      redis:
+        role: Cache and runtime settings for orders-api.
+        logs: '{service="redis"}'
+      loadgen:
+        role: Synthetic traffic. Posts orders through nginx all day.
+        logs: '{service="loadgen"}'
+    disks:
+      /: Root disk. Operating system and Docker.
+      /mnt/mongo-data: Dedicated MongoDB data disk.
