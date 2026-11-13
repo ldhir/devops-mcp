@@ -20,6 +20,7 @@ from fastapi import FastAPI, Request
 from openai import OpenAI
 
 from tools import CONFIG, HERE, TOOLS, call_tool, post_update, redact
+import followup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("runner")
@@ -327,10 +328,16 @@ def investigate(alert: dict) -> None:
             log.exception("could not build structured record")
 
         cost = cost_usd(usage, model)
+        if not quiet and over.get("hold_seconds"):
+            time.sleep(float(over["hold_seconds"]))   # demo recordings: leave the bare alert on screen for a moment
         if not quiet:
             footer = f"_{steps} tool calls · {seconds:.0f}s · {usage['input_tokens'] + usage['output_tokens']:,} tokens"
             footer += f" · ${cost:.2f} · {model}_" if cost is not None else f" · {model}_"
             post_update(final + ("\n\n" + flag if flag else "") + "\n\n" + footer, thread_ts=thread)
+            try:  # keep the conversation so follow-up questions in this thread have its context
+                followup.save_thread(thread, model, [m for m in messages if m.get("content") != RECORD_PROMPT])
+            except Exception:
+                log.exception("could not save thread for follow-ups")
         run_id = over.get("run_id") or f"live-{int(started)}"
         (HERE / "transcripts").mkdir(exist_ok=True)
         (HERE / "transcripts" / f"{run_id}.json").write_text(json.dumps(transcript))
@@ -354,6 +361,14 @@ def investigate(alert: dict) -> None:
 app = FastAPI()
 _seen: dict[str, float] = {}
 _lock = threading.Lock()
+
+
+@app.on_event("startup")
+def start_followups() -> None:
+    try:
+        followup.start(client, AGENT_TOOLS)
+    except Exception:
+        log.exception("could not start follow-up listener")
 
 
 @app.get("/health")
