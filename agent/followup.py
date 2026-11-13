@@ -19,18 +19,12 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from tools import CONFIG, HERE, call_tool, post_update, redact
+from prompts import FOLLOWUP_RULES
+from tools import HERE, call_tool, redact
 
 log = logging.getLogger("followup")
 THREADS = HERE / "threads"
 MAX_STEPS = 10
-
-FOLLOWUP_RULES = """An engineer is now asking a follow-up question in the Slack thread under your write-up. \
-Answer that question directly and briefly (under 120 words unless they ask for detail). Use the tools \
-if the answer is not already in what you gathered. Only state what tool results show; if you cannot \
-find out, say so. You are still read-only: if they ask you to change something, say what you would \
-do and that a person has to do it. Slack formatting: *bold* with single asterisks, `code` with \
-backticks, no # headings, no tables. Times in UTC."""
 
 
 def save_thread(thread_ts: str, model: str, messages: list) -> None:

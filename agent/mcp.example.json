@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "devops-mcp": {
+      "command": "ssh",
+      "args": ["-i", "~/.ssh/your-key.pem", "ubuntu@YOUR_HOST", "cd ~/agent && .venv/bin/python mcp_server.py"]
+    }
+  }
+}

@@ -19,8 +19,9 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Request
 from openai import OpenAI
 
-from tools import CONFIG, HERE, TOOLS, call_tool, post_update, redact
 import followup
+from prompts import RECORD_PROMPT, REVIEW_RULES, SYSTEM
+from tools import CONFIG, HERE, TOOLS, call_tool, post_update, redact
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("runner")
@@ -38,63 +39,6 @@ AGENT_TOOLS = [
     if n != "post_update"
 ]
 
-SYSTEM = """You are the on-call investigator for a DevOps team. A monitoring alert has fired. \
-The alert only names a symptom (for example a full disk or an unreachable instance). Your job is \
-to find the root cause using the tools, then write it up for the engineers in Slack.
-
-How to investigate:
-- Turn the host and mountpoint into a service with service_map.
-- Confirm the symptom with numbers, then find what exactly is growing or failing, as narrowly as \
-the data allows (which database, which collection, which process).
-- Find when it started. Look at the trend over a window of about an hour first and widen only if \
-the change began before it. The start is when the trend changed (change_began), not the time of the \
-first error line: errors come after the cause, and old log lines may belong to an earlier incident.
-- Find what changed at that time. Use what_changed on the affected service and on the services \
-around it. A deploy shortly before the start is a suspect, not proof: read its diff and check that \
-the errors match the code that changed. Then look at logs from the services involved around the start time, \
-especially warnings, errors, config changes, restarts and deploys. Routine request lines are noise; \
-filter them out.
-- The host may have had earlier, unrelated incidents. Anchor on this alert: find the most recent \
-change point before it fired and investigate that one.
-- A query that returns nothing is not evidence. Check the label names and try again.
-- Follow the chain until you reach a cause a person could act on. Do not stop at the symptom.
-- Only state what the tool results show. If you could not verify something, say so.
-
-Before you name a cause, test it. A suspect has to pass all three:
-- Timing: it changed shortly before the start, and it was still in effect when the problem began. \
-A deploy that was replaced before the start was not running. A service doing what it always does \
-did not change.
-- Mechanism: a log line, a diff or a metric shows how it produces this symptom.
-- Size: it accounts for the amount. For a filling disk, use disk_usage_breakdown and compare what \
-the suspect wrote with how much the disk grew. A writer whose own logs show it behaving normally \
-(for example keeping one file of a fixed size) cannot explain growth many times larger.
-Do not claim something a tool result contradicts. Look at the services that write to or call the \
-affected one, not only the affected one itself.
-
-If no suspect passes, the cause is not determined, and that is a valid answer. Say what you \
-established, say what you ruled out and why, say plainly that the cause could not be determined \
-from the available data, and make the first step of the proposed fix the check a person should run \
-to find it (for example listing the largest files on the disk, or asking who stopped the service). \
-Do not present a guess as the cause.
-
-Confidence: high only when timing, mechanism and size are all shown by tool results. Medium when \
-one of them is inferred. Low when the cause is not determined.
-
-You are read-only. You cannot change anything; you propose.
-
-When done, reply with the Slack write-up and nothing else. Slack formatting: *bold* with single \
-asterisks, `code` with backticks, no # headings, no tables. Use exactly these labelled lines:
-
-*Affected:* service and host
-*Started:* UTC time the problem began, and how fast it is moving
-*Root cause:* one or two sentences
-*Evidence:* 2-4 bullets, each with a number or a quoted log line and its time
-*Proposed fix:* concrete steps, immediate first, then cleanup; mention any risk. If a deploy \
-caused it, name the commit to roll back to
-*Confidence:* high / medium / low, plus anything you could not verify
-
-Keep it under 220 words. Times in UTC."""
-
 
 def cost_usd(usage: dict, model: str) -> float | None:
     """Dollar cost of one investigation from the price table in config.yaml."""
@@ -104,61 +48,6 @@ def cost_usd(usage: dict, model: str) -> float | None:
     fresh = usage["input_tokens"] - usage["cached_input_tokens"]
     return round((fresh * price["input"] + usage["cached_input_tokens"] * price["cached_input"]
                   + usage["output_tokens"] * price["output"]) / 1e6, 4)
-
-
-RECORD_PROMPT = """Now restate your conclusion as one JSON object and nothing else, with exactly these keys:
-"affected_service": the single service at the centre of the problem, as named in the service map,
-"started_at_utc": when the problem began, as "YYYY-MM-DDTHH:MM:SSZ", or null if unknown,
-"root_cause": one sentence,
-"proposed_fix": one sentence,
-"cause_determined": true if the evidence shows the cause, false if you could not determine it,
-"confidence": "high", "medium" or "low"."""
-
-
-REVIEW_RULES = """Review the draft incident write-up before it is posted. You cannot run tools. Judge only \
-from the tool results: the investigator's reasoning is not evidence.
-
-Test the root cause the draft names, and separately everything else it says caused or contributed:
-- Timing: the tool results show it changed shortly before the problem began and was still in effect \
-then. Something that was already running the same way before the start did not change. An error that \
-appears after the start is a consequence, not a cause.
-- Mechanism: a log line, diff or metric in the tool results shows how it produces this symptom.
-- Size: the amount fits. Add up what the suspect's own logs or metrics show it wrote or did in the \
-window and compare with the size of the change. If it is far smaller, the test fails. Growth that no \
-metric accounts for is unexplained: do not assign it to a service only because it is the other known \
-writer on the disk.
-- No tool result contradicts the claim.
-
-The default is to keep the draft. Overturn its cause only when you can point to a specific tool \
-result that fails it; put that result in the "why". These are not failures:
-- A cause that the numbers show accounts for most of the change, with a smaller part left over. Size \
-passes. The leftover is simply unexplained, and the write-up should say so without assigning it.
-- A cause that is established but incomplete, for example a crash whose error is shown but where the \
-draft did not name the change that introduced it. Keep the cause; do not call it undetermined.
-- Not knowing who or what triggered an established cause.
-
-Then choose a verdict:
-- "keep": the named cause passes all tests and the draft makes no unsupported claim.
-- "revise": the named cause passes, but the draft also blames or credits something the tool results do \
-not show, or its confidence is higher than the evidence. Rewrite it without the unsupported parts; say \
-plainly what remains unexplained.
-- "not_determined": a specific tool result shows the named cause fails a test (for example it wrote \
-a small fraction of the growth, or it only changed after the problem began). If the tool results clearly establish a different \
-cause that passes all tests, rewrite the write-up around that cause. Otherwise rewrite it to say the \
-cause could not be determined from the available data: keep what was established, say what was ruled \
-out and why, make the first step of the proposed fix the check a person should run to find the cause, \
-and set confidence to low. Do not name a suspect as the cause.
-
-A rewrite keeps the same labelled lines (*Affected:*, *Started:*, *Root cause:*, *Evidence:*, \
-*Proposed fix:*, *Confidence:*), Slack formatting, UTC times, and stays under 220 words. Evidence \
-bullets may only quote what the tool results contain. Keep the draft's *Started:* time unless the tool \
-results show it is wrong.
-
-Reply with one JSON object and nothing else:
-{"tests": {"timing": {"pass": true or false, "why": "..."}, "mechanism": {...}, "size": {...}},
- "unsupported_claims": ["..."],
- "verdict": "keep" or "revise" or "not_determined",
- "writeup": "the full final write-up, or an empty string when the verdict is keep"}"""
 
 
 def review_messages(mode: str, messages: list, alert_text: str, transcript: list, draft: str) -> list:
@@ -227,7 +116,90 @@ def describe(alert: dict) -> str:
     return text
 
 
+def tool_loop(name: str, model: str, messages: list, tools: list, disabled: set, usage: dict) -> tuple[str, int, list]:
+    """Let the model call tools until it writes its answer. Returns (answer, tool calls made, transcript)."""
+    steps, transcript = 0, []
+    while True:
+        force_answer = steps >= MODEL["max_steps"]
+        resp = client.chat.completions.create(
+            model=model, messages=messages, tools=tools,
+            tool_choice="none" if force_answer else "auto",
+        )
+        msg = resp.choices[0].message
+        add_usage(usage, resp)
+        if not msg.tool_calls:
+            final = redact(msg.content or "(no findings returned)")
+            messages.append({"role": "assistant", "content": final})
+            return final, steps, transcript
+        messages.append(msg.model_dump(exclude_none=True))
+        for tc in msg.tool_calls:
+            steps += 1
+            if steps > MODEL["max_steps"]:  # several calls in one turn can overshoot the cap
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                 "content": '{"error": "step limit reached; write up what you have"}'})
+                continue
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            log.info("%s: step %d %s %s", name, steps, tc.function.name, json.dumps(args)[:200])
+            if tc.function.name == "post_update" or tc.function.name in disabled:
+                result = json.dumps({"error": "not available to the investigator"})
+            else:
+                result = call_tool(tc.function.name, args, caller="runner")
+            transcript.append({"tool": tc.function.name, "args": args, "result": result})
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+
+def second_pass(name: str, mode: str, model: str, messages: list, transcript: list, draft: str,
+                usage: dict) -> tuple[str, dict | None, str]:
+    """Check the draft against the evidence before anything is posted.
+    Returns (final text, review summary, flag line for Slack).
+
+    "flag" is the mode in use. It never changes the write-up: replaying a rewriting review over
+    21 saved runs broke as many correct answers as it fixed. A failed timing, mechanism or size
+    test is reliable enough to warn the reader, so that is all it does. The "fresh" and "same"
+    modes rewrite the draft and are kept for evals/replay_review.py.
+    """
+    alert_text = messages[1]["content"]
+    if mode == "flag":
+        _, review = run_review(model, review_messages("fresh", messages, alert_text, transcript, draft), draft, usage)
+        failed = {k: v.get("why", "") for k, v in (review.get("tests") or {}).items()
+                  if isinstance(v, dict) and v.get("pass") is False}
+        review["double_check"] = bool(failed) or review.get("verdict") == "not_determined"
+        if not review["double_check"]:
+            return draft, review, ""
+        why = " ".join(f"{k.capitalize()}: {w}" for k, w in failed.items())[:420]
+        log.info("%s: write-up flagged for double-check (%s)", name, ", ".join(failed) or "not determined")
+        return draft, review, (":warning: *Double-check this one.* A second pass over the same evidence could not "
+                               "confirm the cause." + (f" {why}" if why else ""))
+    if mode in ("fresh", "same"):
+        final, review = run_review(model, review_messages(mode, messages, alert_text, transcript, draft), draft, usage)
+        if final != draft:
+            log.info("%s: review verdict %s; write-up replaced", name, review.get("verdict"))
+            messages.append({"role": "user", "content":
+                             "A reviewer checked your draft against the tool results and replaced it. "
+                             "The final write-up is:\n\n" + final})
+            messages.append({"role": "assistant", "content": "Understood. That is the final write-up."})
+        return final, review, ""
+    return draft, None, ""
+
+
+def structured_record(model: str, messages: list, usage: dict) -> dict | None:
+    """A small structured copy of the conclusion, so code can grade it."""
+    try:
+        resp = client.chat.completions.create(
+            model=model, messages=messages + [{"role": "user", "content": RECORD_PROMPT}],
+            response_format={"type": "json_object"})
+        add_usage(usage, resp)
+        return json.loads(redact(resp.choices[0].message.content or "{}"))
+    except Exception:
+        log.exception("could not build structured record")
+        return None
+
+
 def investigate(alert: dict) -> None:
+    """One alert, start to finish: post it, investigate, check, post the write-up, save the run."""
     name = alert.get("labels", {}).get("alertname", "alert")
     over = load_override()
     model = over.get("model") or MODEL["name"]
@@ -243,101 +215,32 @@ def investigate(alert: dict) -> None:
             return
     try:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload = {k: alert.get(k) for k in ("status", "labels", "annotations", "startsAt", "values")}
         messages = [
             {"role": "system", "content": SYSTEM},
-            {
-                "role": "user",
-                "content": f"Time now: {now}\nAlert payload from Grafana:\n"
-                + redact(json.dumps({k: alert.get(k) for k in ("status", "labels", "annotations", "startsAt", "values")}, default=str)),
-            },
+            {"role": "user", "content": f"Time now: {now}\nAlert payload from Grafana:\n" + redact(json.dumps(payload, default=str))},
         ]
-        steps = 0
         started = time.time()
         usage = {"llm_calls": 0, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
-        transcript = []
-        final = None
-        while final is None:
-            force_answer = steps >= MODEL["max_steps"]
-            resp = client.chat.completions.create(
-                model=model, messages=messages, tools=tools,
-                tool_choice="none" if force_answer else "auto",
-            )
-            msg = resp.choices[0].message
-            add_usage(usage, resp)
-            if not msg.tool_calls:
-                final = redact(msg.content or "(no findings returned)")
-                messages.append({"role": "assistant", "content": final})
-                break
-            messages.append(msg.model_dump(exclude_none=True))
-            for tc in msg.tool_calls:
-                steps += 1
-                if steps > MODEL["max_steps"]:  # several calls in one turn can overshoot the cap
-                    messages.append({"role": "tool", "tool_call_id": tc.id,
-                                     "content": '{"error": "step limit reached; write up what you have"}'})
-                    continue
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                log.info("%s: step %d %s %s", name, steps, tc.function.name, json.dumps(args)[:200])
-                if tc.function.name == "post_update" or tc.function.name in disabled:
-                    result = json.dumps({"error": "not available to the investigator"})
-                else:
-                    result = call_tool(tc.function.name, args, caller="runner")
-                transcript.append({"tool": tc.function.name, "args": args, "result": result})
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-        # Second pass: check the draft against the evidence before anything is posted.
-        draft, review, flag = final, None, ""
+        draft, steps, transcript = tool_loop(name, model, messages, tools, disabled, usage)
         mode = over.get("review") or MODEL.get("review") or "off"
-        if mode == "flag":
-            # The review does not change the write-up. Replaying it over 21 saved runs showed that letting
-            # it rewrite answers broke as many correct ones as it fixed. Its strongest signal (a failed
-            # timing, mechanism or size test) is reliable enough to warn the reader, so that is all it does.
-            _, review = run_review(model, review_messages("fresh", messages, messages[1]["content"], transcript, draft),
-                                   draft, usage)
-            failed = {k: v.get("why", "") for k, v in (review.get("tests") or {}).items()
-                      if isinstance(v, dict) and v.get("pass") is False}
-            review["double_check"] = bool(failed) or review.get("verdict") == "not_determined"
-            if review["double_check"]:
-                why = " ".join(f"{k.capitalize()}: {w}" for k, w in failed.items())[:420]
-                flag = (":warning: *Double-check this one.* A second pass over the same evidence could not "
-                        "confirm the cause." + (f" {why}" if why else ""))
-                log.info("%s: write-up flagged for double-check (%s)", name, ", ".join(failed) or "not determined")
-        elif mode in ("fresh", "same"):
-            final, review = run_review(model, review_messages(mode, messages, messages[1]["content"], transcript, draft),
-                                       draft, usage)
-            if final != draft:
-                log.info("%s: review verdict %s; write-up replaced", name, review.get("verdict"))
-                messages.append({"role": "user", "content":
-                                 "A reviewer checked your draft against the tool results and replaced it. "
-                                 "The final write-up is:\n\n" + final})
-                messages.append({"role": "assistant", "content": "Understood. That is the final write-up."})
-
+        final, review, flag = second_pass(name, mode, model, messages, transcript, draft, usage)
         seconds = round(time.time() - started, 1)  # alert to write-up; excludes the record step below
-
-        # A small structured copy of the conclusion, so code can grade it.
-        record = None
-        try:
-            messages.append({"role": "user", "content": RECORD_PROMPT})
-            resp = client.chat.completions.create(
-                model=model, messages=messages, response_format={"type": "json_object"})
-            add_usage(usage, resp)
-            record = json.loads(redact(resp.choices[0].message.content or "{}"))
-        except Exception:
-            log.exception("could not build structured record")
-
+        record = structured_record(model, messages, usage)
         cost = cost_usd(usage, model)
-        if not quiet and over.get("hold_seconds"):
-            time.sleep(float(over["hold_seconds"]))   # demo recordings: leave the bare alert on screen for a moment
+
         if not quiet:
+            if over.get("hold_seconds"):   # demo recordings: leave the bare alert on screen for a moment
+                time.sleep(float(over["hold_seconds"]))
             footer = f"_{steps} tool calls · {seconds:.0f}s · {usage['input_tokens'] + usage['output_tokens']:,} tokens"
             footer += f" · ${cost:.2f} · {model}_" if cost is not None else f" · {model}_"
             post_update(final + ("\n\n" + flag if flag else "") + "\n\n" + footer, thread_ts=thread)
             try:  # keep the conversation so follow-up questions in this thread have its context
-                followup.save_thread(thread, model, [m for m in messages if m.get("content") != RECORD_PROMPT])
+                followup.save_thread(thread, model, messages)
             except Exception:
                 log.exception("could not save thread for follow-ups")
+
         run_id = over.get("run_id") or f"live-{int(started)}"
         (HERE / "transcripts").mkdir(exist_ok=True)
         (HERE / "transcripts" / f"{run_id}.json").write_text(json.dumps(transcript))

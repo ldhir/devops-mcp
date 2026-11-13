@@ -1,7 +1,7 @@
-"""MCP server (stdio). Exposes the same tools the alert runner uses,
-so an engineer can ask the same questions from Claude Code.
+"""MCP server (stdio). Exposes the same read tools the alert runner uses,
+so an engineer can ask the same questions from Claude Code or any MCP client.
 
-Run:  .venv/bin/python mcp_server.py
+Run:  .venv/bin/python mcp_server.py        (needs the mcp package, version 2 or later)
 """
 import anyio
 import mcp.types as types
@@ -10,21 +10,28 @@ from mcp.server.stdio import stdio_server
 
 from tools import TOOLS, call_tool
 
-server = Server("devops-mcp")
+# Posting to Slack is the alert runner's job. An MCP client only gets the read tools.
+HIDDEN = {"post_update"}
 
 
-@server.list_tools()
-async def list_tools() -> list[types.Tool]:
-    return [
+async def list_tools(ctx, params) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=[
         types.Tool(name=name, description=spec["description"], inputSchema=spec["parameters"])
         for name, spec in TOOLS.items()
-    ]
+        if name not in HIDDEN
+    ])
 
 
-@server.call_tool()
-async def run_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
-    text = await anyio.to_thread.run_sync(call_tool, name, arguments or {}, "mcp")
-    return [types.TextContent(type="text", text=text)]
+async def run_tool(ctx, params) -> types.CallToolResult:
+    if params.name in HIDDEN:
+        text = '{"error": "not available over MCP"}'
+    else:
+        # Same choke point as the runner: allowlist, masking, audit log.
+        text = await anyio.to_thread.run_sync(call_tool, params.name, params.arguments or {}, "mcp")
+    return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+
+
+server = Server("devops-mcp", on_list_tools=list_tools, on_call_tool=run_tool)
 
 
 async def main() -> None:

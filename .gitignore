@@ -9,3 +9,5 @@ __pycache__/
 .DS_Store
 threads/
 transcripts/
+agent/mcp.json
+override.json

@@ -95,7 +95,7 @@ sequenceDiagram
 
 Three of these exist because the agent failed without them. In early runs it missed a single config-change log line buried under thousands of routine request lines, so `log_summary` now surfaces rare lines first. It also guessed a metric label wrong and read the empty result as "no data", so empty results now come back with the label names that do exist. And in the first eval pass it kept blaming a backup job for disk growth the job could not have produced, so `disk_usage_breakdown` now puts the numbers side by side: how much the disk grew, how much each database and collection grew, and how much is left unexplained.
 
-The same tools are exposed as an MCP server (`agent/mcp_server.py`), so an engineer can ask the same questions from Claude Code.
+The same read tools are exposed as an MCP server (`agent/mcp_server.py`), so an engineer can ask the same questions from Claude Code, or run a whole investigation there without the OpenAI API. See "Using Claude Code" below.
 
 ## Guardrails
 
@@ -266,11 +266,84 @@ cd evals && ~/agent/.venv/bin/python run_evals.py --repeats 3
 
 For follow-up questions in Slack, turn on Socket Mode for the Slack app, subscribe it to `app_mention`, and put the app-level token in `.env` as `SLACK_APP_TOKEN`.
 
+## Integrating with your own stack
+
+The lab is a stand-in. To point the agent at a real environment you change one config file and supply read-only logins. No code changes are needed if your stack matches the assumptions listed at the end of this section.
+
+**1. Put it on a machine inside your network.** It needs to reach Prometheus, Loki and Jenkins directly, and to reach out to Slack, Bitbucket and the model API. Nothing has to reach it from the internet. Grafana must be able to call it on port 8088.
+
+**2. Give it read-only logins, in `agent/.env`:**
+
+| Variable | What it is | Access it needs |
+|---|---|---|
+| `SLACK_BOT_TOKEN` | Slack bot token | `chat:write` in the alerts channel |
+| `SLACK_APP_TOKEN` | Slack app-level token (optional) | `connections:write`, only for follow-up questions |
+| `OPENAI_API_KEY` | model API key | |
+| `JENKINS_USER`, `JENKINS_PASSWORD` | a Jenkins user for the agent | read only; it should get a 403 on build |
+| `BITBUCKET_TOKEN` | repository access token | repository read |
+
+**3. Describe your environment in `agent/config.yaml`:**
+
+- `sources`: the URLs of Prometheus, Loki and Jenkins.
+- `service_map`: for each host, its services. For each service: what it does (`role`), what it calls (`depends_on`), its Prometheus job (`metrics_job`), its Jenkins deploy job (`deploy_job`) and its repository (`repo`). This is how the agent turns "disk full on host X" into a service, and how it knows who writes to what.
+- `disk_accounting`: for each disk worth explaining, the size metrics of what lives on it and the services that write there with no size metric. `disk_usage_breakdown` uses this to say how much growth is accounted for.
+- `slack.channel`, and `prices` for the model you use.
+
+**4. Send alerts to it.** In Grafana, add a webhook contact point with the URL `http://<agent-host>:8088/alert` and route the alerts you want investigated to it. The agent posts the alert to Slack itself, then replies in that thread. `lab/grafana/provisioning/alerting/alerting.yml` is a working example.
+
+**5. Run it as a service.** `agent/alert-runner.service` is the systemd unit the lab uses.
+
+**6. Start somewhere safe.** Point it at a staging environment first and read a week of write-ups before trusting it on production alerts.
+
+What the code assumes today, so you know what would need changing:
+
+- Logs are in Loki with a `service` label that matches the names in `service_map`.
+- Hosts run node_exporter, and `instance` in Prometheus is the host name used in `service_map`.
+- Prometheus and Loki are reachable without a login. Token or basic auth for them is not implemented yet.
+- Deploys go through a Jenkins job whose build description is `<commit> <subject>`. `lab/jenkins/jenkins.yaml` shows the job.
+- Code is on Bitbucket Cloud.
+- `what_changed` reports which version was running only for the lab app, through its `orders_build_info` metric. Other services still get deploys, restarts and log changes.
+- Log lines and metric values are sent to the model provider. Phone numbers and emails are masked first; nothing else is. Check that this is allowed for your data before you connect it.
+
+## Using Claude Code
+
+There are two ways to use Claude Code with this, and neither needs an OpenAI key. Both go through the MCP server, so the tool allowlist, the masking and the audit log are the same as in the alert runner. The MCP server offers the ten read tools and does not offer posting to Slack.
+
+**Ask questions from Claude Code.** Register the server once. If Claude Code runs on the same machine as the agent:
+
+```bash
+claude mcp add devops-mcp -- /path/to/agent/.venv/bin/python /path/to/agent/mcp_server.py
+```
+
+If the agent is on another machine, start it over SSH:
+
+```bash
+claude mcp add devops-mcp -- ssh -i ~/.ssh/your-key.pem ubuntu@YOUR_HOST "cd ~/agent && .venv/bin/python mcp_server.py"
+```
+
+Then ask in plain words: "what changed on orders-api in the last hour?", "how full is the MongoDB disk and what is growing?".
+
+**Run a whole investigation with Claude Code in place of the OpenAI API.** `agent/claude_code_investigate.py` hands Claude Code the same investigation prompt and the MCP tools, and prints the write-up:
+
+```bash
+cd agent
+cp mcp.example.json mcp.json      # edit the host and key path
+python claude_code_investigate.py --mcp-config mcp.json \
+  "Disk almost full: /mnt/mongo-data on lab-host-1 is over 85% full"
+```
+
+I ran this against the slow-burn deploy scenario. It named commit `d3e9efb` and the `shop.order_snapshots` collection in 31 seconds, the same answer the runner gave.
+
+What this path does not do yet: it is not wired to the Grafana webhook, it does not post to Slack, and it skips the second pass and the cost record. It has also not been through the eval suite, so the scorecard above says nothing about it. To run it unattended you need a long-lived Claude Code login (`claude setup-token`).
+
+The alert runner itself (`runner.py`) only speaks the OpenAI API today. A Claude provider for the runner is not written.
+
 ## Layout
 
 ```
 agent/    tools.py (the tools, redaction, audit log), runner.py (alert runner and second pass),
-          followup.py (Slack follow-ups), mcp_server.py, config.yaml (model, prices, service map)
+          prompts.py (every prompt), followup.py (Slack follow-ups), mcp_server.py,
+          claude_code_investigate.py (investigate with Claude Code), config.yaml (model, prices, service map)
 lab/      docker-compose.yml, the demo app, Grafana rules, Jenkins config, break/reset scripts
 evals/    scenarios.yaml (failures and answer keys), run_evals.py (harness and grader),
           replay_review.py (replays the second pass over saved runs)
@@ -284,5 +357,5 @@ evals/    scenarios.yaml (failures and answer keys), run_evals.py (harness and g
 - Redaction misses phone numbers written as a bare run of digits, because they look like timestamps.
 - Jenkins runs as root with the Docker socket in the lab. Fine for a lab, wrong for production.
 - Seven scenarios and three runs each is a small test. The numbers above are indications, not rates.
-- The MCP server exposes the same tools but I have not tested it from a client yet.
+- The Claude Code path is tested by hand on one scenario, not by the eval suite.
 - Nothing writes yet. The next step is a Slack button under the proposed fix that runs one allowlisted Jenkins job, such as a rollback.
