@@ -6,6 +6,8 @@ model:
   name: gpt-5.4
   base_url: ""            # leave empty for api.openai.com
   max_steps: 24          # hard cap on tool calls per investigation
+  review: "flag"         # second pass over the evidence before posting. "flag" adds a double-check
+                         # warning when the cause fails a timing, mechanism or size test; "off" skips it
 
 # USD per 1M tokens, from OpenAI's model pages on 2026-11-12. Update when
 # prices or the model change; a model missing here is logged with cost null.

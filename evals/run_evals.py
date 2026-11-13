@@ -89,6 +89,12 @@ def cleanup(scn: dict | None) -> None:
     sh("sudo docker exec lab-backup-1 rm -f /tmp/break_verify")
     sh("sudo rm -f /mnt/mongo-data/export_tmp.bin")
     if running_version() != GOOD_COMMIT:
+        # The deploy job's health check needs MongoDB, which is down if the disk is full. Free the
+        # disk first, or the rollback is recorded as a failed build that the next run would see.
+        sh(f"cd {LAB} && sudo docker compose stop mongodb backup")
+        sh("sudo find /mnt/mongo-data -mindepth 1 -delete")
+        sh(f"cd {LAB} && sudo docker compose start mongodb backup")
+        time.sleep(15)
         say("  rollback deploy: " + sh(f"bash {LAB}/scripts/jenkins-deploy.sh last-good").strip()[-60:])
     sh("sudo docker start lab-orders-api-1")
 
@@ -172,6 +178,10 @@ def check_quotes(text: str, transcript: list) -> dict:
     """
     hay = _norm(json.dumps(transcript))
     checked, missing = 0, []
+    # Only the Evidence section is quoted evidence. Commands in the proposed fix are not.
+    m = re.search(r"\*Evidence:?\*:?(.*?)(?=\*Proposed fix|\*Confidence|\Z)", text, re.S)
+    if m and m.group(1).strip():
+        text = m.group(1)
     for span in dict.fromkeys(re.findall(r"`([^`\n]+)`", text)):
         if len(span) < 12 or not re.search(r"[A-Za-z]{4}", span):
             continue
@@ -292,7 +302,8 @@ def run_one(cfg_name: str, scn: dict, repeat: int) -> dict:
         result = {**base, "status": "ok", "alert_fired": row.get("alert"), "t_inject": t_inject, "t_truth": t_truth,
                   "alert_delay_seconds": round(alert_at - t_truth) if alert_at else None,
                   **{k: row.get(k) for k in ("tool_calls", "seconds", "llm_calls", "input_tokens",
-                                             "cached_input_tokens", "output_tokens", "cost_usd", "record", "text")},
+                                             "cached_input_tokens", "output_tokens", "cost_usd", "record", "text",
+                                             "review", "draft_text")},
                   **grade(scn, row, t_truth)}
         say(f"  {result['checks']}  ${result.get('cost_usd')}  {result.get('seconds')}s")
     with RESULTS.open("a") as f:

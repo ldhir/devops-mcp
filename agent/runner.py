@@ -114,6 +114,82 @@ RECORD_PROMPT = """Now restate your conclusion as one JSON object and nothing el
 "confidence": "high", "medium" or "low"."""
 
 
+REVIEW_RULES = """Review the draft incident write-up before it is posted. You cannot run tools. Judge only \
+from the tool results: the investigator's reasoning is not evidence.
+
+Test the root cause the draft names, and separately everything else it says caused or contributed:
+- Timing: the tool results show it changed shortly before the problem began and was still in effect \
+then. Something that was already running the same way before the start did not change. An error that \
+appears after the start is a consequence, not a cause.
+- Mechanism: a log line, diff or metric in the tool results shows how it produces this symptom.
+- Size: the amount fits. Add up what the suspect's own logs or metrics show it wrote or did in the \
+window and compare with the size of the change. If it is far smaller, the test fails. Growth that no \
+metric accounts for is unexplained: do not assign it to a service only because it is the other known \
+writer on the disk.
+- No tool result contradicts the claim.
+
+The default is to keep the draft. Overturn its cause only when you can point to a specific tool \
+result that fails it; put that result in the "why". These are not failures:
+- A cause that the numbers show accounts for most of the change, with a smaller part left over. Size \
+passes. The leftover is simply unexplained, and the write-up should say so without assigning it.
+- A cause that is established but incomplete, for example a crash whose error is shown but where the \
+draft did not name the change that introduced it. Keep the cause; do not call it undetermined.
+- Not knowing who or what triggered an established cause.
+
+Then choose a verdict:
+- "keep": the named cause passes all tests and the draft makes no unsupported claim.
+- "revise": the named cause passes, but the draft also blames or credits something the tool results do \
+not show, or its confidence is higher than the evidence. Rewrite it without the unsupported parts; say \
+plainly what remains unexplained.
+- "not_determined": a specific tool result shows the named cause fails a test (for example it wrote \
+a small fraction of the growth, or it only changed after the problem began). If the tool results clearly establish a different \
+cause that passes all tests, rewrite the write-up around that cause. Otherwise rewrite it to say the \
+cause could not be determined from the available data: keep what was established, say what was ruled \
+out and why, make the first step of the proposed fix the check a person should run to find the cause, \
+and set confidence to low. Do not name a suspect as the cause.
+
+A rewrite keeps the same labelled lines (*Affected:*, *Started:*, *Root cause:*, *Evidence:*, \
+*Proposed fix:*, *Confidence:*), Slack formatting, UTC times, and stays under 220 words. Evidence \
+bullets may only quote what the tool results contain. Keep the draft's *Started:* time unless the tool \
+results show it is wrong.
+
+Reply with one JSON object and nothing else:
+{"tests": {"timing": {"pass": true or false, "why": "..."}, "mechanism": {...}, "size": {...}},
+ "unsupported_claims": ["..."],
+ "verdict": "keep" or "revise" or "not_determined",
+ "writeup": "the full final write-up, or an empty string when the verdict is keep"}"""
+
+
+def review_messages(mode: str, messages: list, alert_text: str, transcript: list, draft: str) -> list:
+    """Messages for the pre-post review. 'same' continues the investigator's own conversation;
+    'fresh' gives a new context only the alert, the tool calls and results, and the draft."""
+    if mode == "same":
+        return messages + [{"role": "user", "content": REVIEW_RULES + "\n\nThe draft is your last message."}]
+    calls = "\n\n".join(
+        f"TOOL CALL {i}: {t['tool']} {json.dumps(t['args'])}\nRESULT: {t['result']}" for i, t in enumerate(transcript, 1))
+    return [
+        {"role": "system", "content": "You are a careful reviewer of incident write-ups for a DevOps team.\n\n" + REVIEW_RULES},
+        {"role": "user", "content": f"ALERT:\n{alert_text}\n\nTOOL CALLS AND RESULTS:\n{calls}\n\nDRAFT WRITE-UP:\n{draft}"},
+    ]
+
+
+def run_review(model: str, msgs: list, draft: str, usage: dict) -> tuple[str, dict]:
+    """One review call. Returns (final text, review summary). Falls back to the draft on any error."""
+    try:
+        resp = client.chat.completions.create(model=model, messages=msgs, response_format={"type": "json_object"})
+        add_usage(usage, resp)
+        rv = json.loads(resp.choices[0].message.content or "{}")
+    except Exception as exc:
+        log.exception("review failed; posting the draft")
+        return draft, {"verdict": "error", "error": f"{type(exc).__name__}: {exc}"}
+    verdict = rv.get("verdict")
+    text = redact((rv.get("writeup") or "").strip())
+    changed = verdict in ("revise", "not_determined") and len(text) > 80
+    summary = {"verdict": verdict if (verdict == "keep" or changed) else "keep",
+               "tests": rv.get("tests"), "unsupported_claims": rv.get("unsupported_claims") or []}
+    return (text if changed else draft), summary
+
+
 def load_override() -> dict:
     """Optional per-run settings written by the eval harness (model, disabled tools, run id)."""
     path = HERE / "override.json"
@@ -210,6 +286,33 @@ def investigate(alert: dict) -> None:
                 transcript.append({"tool": tc.function.name, "args": args, "result": result})
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
+        # Second pass: check the draft against the evidence before anything is posted.
+        draft, review, flag = final, None, ""
+        mode = over.get("review") or MODEL.get("review") or "off"
+        if mode == "flag":
+            # The review does not change the write-up. Replaying it over 21 saved runs showed that letting
+            # it rewrite answers broke as many correct ones as it fixed. Its strongest signal (a failed
+            # timing, mechanism or size test) is reliable enough to warn the reader, so that is all it does.
+            _, review = run_review(model, review_messages("fresh", messages, messages[1]["content"], transcript, draft),
+                                   draft, usage)
+            failed = {k: v.get("why", "") for k, v in (review.get("tests") or {}).items()
+                      if isinstance(v, dict) and v.get("pass") is False}
+            review["double_check"] = bool(failed) or review.get("verdict") == "not_determined"
+            if review["double_check"]:
+                why = " ".join(f"{k.capitalize()}: {w}" for k, w in failed.items())[:420]
+                flag = (":warning: *Double-check this one.* A second pass over the same evidence could not "
+                        "confirm the cause." + (f" {why}" if why else ""))
+                log.info("%s: write-up flagged for double-check (%s)", name, ", ".join(failed) or "not determined")
+        elif mode in ("fresh", "same"):
+            final, review = run_review(model, review_messages(mode, messages, messages[1]["content"], transcript, draft),
+                                       draft, usage)
+            if final != draft:
+                log.info("%s: review verdict %s; write-up replaced", name, review.get("verdict"))
+                messages.append({"role": "user", "content":
+                                 "A reviewer checked your draft against the tool results and replaced it. "
+                                 "The final write-up is:\n\n" + final})
+                messages.append({"role": "assistant", "content": "Understood. That is the final write-up."})
+
         seconds = round(time.time() - started, 1)  # alert to write-up; excludes the record step below
 
         # A small structured copy of the conclusion, so code can grade it.
@@ -227,7 +330,7 @@ def investigate(alert: dict) -> None:
         if not quiet:
             footer = f"_{steps} tool calls · {seconds:.0f}s · {usage['input_tokens'] + usage['output_tokens']:,} tokens"
             footer += f" · ${cost:.2f} · {model}_" if cost is not None else f" · {model}_"
-            post_update(final + "\n\n" + footer, thread_ts=thread)
+            post_update(final + ("\n\n" + flag if flag else "") + "\n\n" + footer, thread_ts=thread)
         run_id = over.get("run_id") or f"live-{int(started)}"
         (HERE / "transcripts").mkdir(exist_ok=True)
         (HERE / "transcripts" / f"{run_id}.json").write_text(json.dumps(transcript))
@@ -236,7 +339,8 @@ def investigate(alert: dict) -> None:
                 "ts": now, "run_id": run_id, "alert": name, "labels": alert.get("labels", {}),
                 "alert_started": alert.get("startsAt"), "model": model,
                 "disabled_tools": sorted(disabled), "tool_calls": steps, "seconds": seconds,
-                **usage, "cost_usd": cost, "record": record, "text": final}) + "\n")
+                **usage, "cost_usd": cost, "record": record, "text": final,
+                "review": review, "draft_text": draft if draft != final else None}) + "\n")
         log.info("%s: write-up done after %d tool calls, %ss, cost %s", name, steps, seconds, cost)
     except Exception as exc:
         log.exception("investigation failed")
