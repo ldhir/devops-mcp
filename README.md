@@ -6,6 +6,12 @@ Most alerting tells you a symptom: "disk almost full", "instance not responding"
 
 I built it against a small replica of a real EC2 stack, with failures I plant on purpose so I can score whether the agent gets them right.
 
+## Demo
+
+[![Watch the 74-second demo](docs/demo-poster.png)](docs/demo.mp4)
+
+A 74-second walkthrough ([docs/demo.mp4](docs/demo.mp4)): the bare alert, the write-up that follows it, how the agent got there, what it costs, the eval scorecard with the misses, and a follow-up question in Slack. Everything on screen is from a live run on the lab or from the saved eval results.
+
 ## What it looks like
 
 Grafana fires this, and nothing more:
