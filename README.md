@@ -82,6 +82,7 @@ sequenceDiagram
 | `host_health` | Is the host up, how full are its disks, memory, CPU | Prometheus |
 | `query_metrics` | Any PromQL query, now or as a trend over a window | Prometheus |
 | `list_metrics` | What metrics exist with this word in the name | Prometheus |
+| `disk_usage_breakdown` | How much a disk grew, how much each known consumer accounts for, and how much is unexplained | Prometheus |
 | `log_summary` | Log lines counted by kind, rarest first | Loki |
 | `get_logs` | Raw log lines with filters | Loki |
 | `list_deploys` | Deploy history for a service | Jenkins |

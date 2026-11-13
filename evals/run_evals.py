@@ -38,7 +38,8 @@ CONFIGS = {
     "gpt-5.4": {"model": "gpt-5.4", "disabled_tools": []},
     "gpt-5.4-mini": {"model": "gpt-5.4-mini", "disabled_tools": []},
     # Same model without the two workflow tools: raw metrics and logs only.
-    "gpt-5.4 primitives only": {"model": "gpt-5.4", "disabled_tools": ["what_changed", "log_summary"]},
+    "gpt-5.4 primitives only": {"model": "gpt-5.4",
+                                "disabled_tools": ["what_changed", "log_summary", "disk_usage_breakdown"]},
 }
 
 for line in (AGENT / ".env").read_text().splitlines():
@@ -95,12 +96,17 @@ def cleanup(scn: dict | None) -> None:
 def reset() -> None:
     """A clean, healthy lab with no leftover metrics or logs from earlier runs."""
     cleanup(None)
-    sh(f"cd {LAB} && sudo docker compose stop mongodb orders-api loadgen backup prometheus loki")
+    # Stop the log shipper first, then remove (not just stop) every container that logs.
+    # A stopped container keeps its old log file, and the shipper re-sends or retries those
+    # lines into the fresh Loki, which put the previous run's errors into the next run.
+    sh(f"cd {LAB} && sudo docker compose stop promtail")
+    sh(f"cd {LAB} && sudo docker compose rm -sf promtail loadgen nginx orders-api backup mongodb redis prometheus loki mongodb-exporter node-exporter")
     sh("sudo find /mnt/mongo-data -mindepth 1 -delete")
     # Wipe metrics and logs so one run's incident cannot leak into the next one's evidence.
-    sh(f"cd {LAB} && sudo docker compose rm -f prometheus loki")
     sh("sudo docker volume rm lab_prometheus-data lab_loki-data")
-    sh(f"cd {LAB} && sudo docker compose up -d")
+    global RESET_DONE_AT
+    RESET_DONE_AT = time.time()
+    sh(f"cd {LAB} && sudo docker compose up -d --no-build")
     sh("sudo systemctl restart alert-runner")
     deadline = time.time() + 300
     while time.time() < deadline:
@@ -110,6 +116,21 @@ def reset() -> None:
             return
         time.sleep(5)
     raise RuntimeError("lab did not return to healthy within 5 minutes")
+
+
+RESET_DONE_AT = 0.0
+
+
+def stale_log_lines() -> int | None:
+    """Log lines in Loki dated before the last reset. Should be 0; anything else is a leak.
+    Grafana and Jenkins are left running across resets, so their own logs are not counted."""
+    try:
+        r = httpx.get("http://127.0.0.1:3100/loki/api/v1/query_range", timeout=20, params={
+            "query": '{service=~".+", service!~"grafana|jenkins"}', "limit": 200, "direction": "forward",
+            "start": int((RESET_DONE_AT - 6 * 3600) * 1e9), "end": int((RESET_DONE_AT - 1) * 1e9)})
+        return sum(len(s["values"]) for s in r.json()["data"]["result"])
+    except Exception:
+        return None
 
 
 def wait_writeup(run_id: str) -> dict | None:
@@ -160,7 +181,14 @@ def check_quotes(text: str, transcript: list) -> dict:
         if not parts:
             continue
         checked += 1
-        if not all(_norm(p) in hay for p in parts):
+        if all(_norm(p) in hay for p in parts):
+            continue
+        # Not a verbatim quote. The model often abbreviates (`shop.orders totalSize`,
+        # `shop-*.archive`), so accept a span whose every name and long number was seen
+        # in the tool results. An invented identifier or figure still fails.
+        tokens = [t for t in re.split(r"[^A-Za-z0-9_\-]+", span)
+                  if (len(t) >= 4 and re.search(r"[A-Za-z]", t)) or (t.isdigit() and len(t) >= 5)]
+        if not tokens or not all(_norm(t) in hay for t in tokens):
             missing.append(span[:120])
     return {"checked": checked, "missing": missing}
 
@@ -246,6 +274,10 @@ def run_one(cfg_name: str, scn: dict, repeat: int) -> dict:
     reset()
     (AGENT / "override.json").write_text(json.dumps({**cfg, "run_id": run_id, "quiet": True}))
     time.sleep(BASELINE_SECONDS)
+    stale = stale_log_lines()
+    base["stale_log_lines"] = stale
+    if stale:
+        say(f"  WARNING: {stale} log lines from before the reset are visible; this run is contaminated")
     t_inject = time.time()
     out = sh(scn["inject"])
     marks = re.findall(r"T0=(\d+)", out)

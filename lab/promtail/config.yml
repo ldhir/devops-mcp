@@ -9,6 +9,13 @@ scrape_configs:
     docker_sd_configs:
       - host: unix:///var/run/docker.sock
         refresh_interval: 5s
+    # A freshly started shipper reads every container's log from the beginning. Drop old
+    # lines so a restart (or an eval reset) cannot replay history into Loki. Lab choice:
+    # it also means lines are lost if Loki is down for longer than this.
+    pipeline_stages:
+      - drop:
+          older_than: 5m
+          drop_counter_reason: older_than_5m
     relabel_configs:
       - source_labels: [__meta_docker_container_name]
         regex: "/(.*)"

@@ -62,3 +62,18 @@ service_map:
     disks:
       /: Root disk. Operating system and Docker.
       /mnt/mongo-data: Dedicated MongoDB data disk.
+
+# For disk_usage_breakdown: what is known to live on each disk. "measured" entries have a
+# size metric in bytes; "unmeasured_writers" are services that write there with no size metric.
+disk_accounting:
+  lab-host-1:
+    /mnt/mongo-data:
+      measured:
+        - name: MongoDB databases (data and indexes)
+          promql: 'mongodb_dbstats_totalSize{instance="lab-host-1"}'
+          labels: [database]
+        - name: MongoDB collections (data and indexes)
+          promql: 'mongodb_collstats_storageStats_totalSize{instance="lab-host-1"}'
+          labels: [database, collection]
+          detail_only: true
+      unmeasured_writers: [backup]

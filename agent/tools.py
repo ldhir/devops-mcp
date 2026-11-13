@@ -147,33 +147,168 @@ def query_metrics(promql: str, minutes_back: int = 0) -> dict:
         return out
     end = time.time()
     start = end - minutes_back * 60
-    step = max(15, int(minutes_back * 60 / 40))
-    data = _prom(
-        "/api/v1/query_range",
-        {"query": promql, "start": start, "end": end, "step": step},
-    )
+    raw, step = _range(promql, minutes_back, end)
+    # Series that moved the most come first, so the cap below drops the flat ones.
+    raw.sort(key=lambda s: -abs(s["pts"][-1][1] - s["pts"][0][1]))
     series = []
-    for s in data["result"][:20]:
-        pts = [(float(t), float(v)) for t, v in s["values"] if v not in ("NaN", "+Inf", "-Inf")]
-        if not pts:
-            continue
+    for s in raw[:20]:
+        pts = s["pts"]
         lo = min(pts, key=lambda p: p[1])
         hi = max(pts, key=lambda p: p[1])
         stride = max(1, len(pts) // 20)
-        series.append(
-            {
-                "labels": {k: v for k, v in s["metric"].items() if k != "__name__"},
-                "first": [_iso(pts[0][0]), round(pts[0][1], 3)],
-                "last": [_iso(pts[-1][0]), round(pts[-1][1], 3)],
-                "min": [_iso(lo[0]), round(lo[1], 3)],
-                "max": [_iso(hi[0]), round(hi[1], 3)],
-                "points": [[_iso(t), round(v, 3)] for t, v in pts[::stride]],
-            }
-        )
+        row = {
+            "labels": s["labels"],
+            "first": [_iso(pts[0][0]), round(pts[0][1], 3)],
+            "last": [_iso(pts[-1][0]), round(pts[-1][1], 3)],
+            "min": [_iso(lo[0]), round(lo[1], 3)],
+            "max": [_iso(hi[0]), round(hi[1], 3)],
+            "points": [[_iso(t), round(v, 3)] for t, v in pts[::stride]],
+        }
+        if pts[0][0] > start + 2 * step:
+            row["series_begins"] = _iso(pts[0][0]) + " (no samples earlier in this window: the series is new or was not scraped before)"
+        if end - pts[-1][0] > max(90, 2 * step):
+            row["series_stops"] = _iso(pts[-1][0]) + " (no samples after this: the target stopped reporting)"
+        began = _change_began(promql, s["labels"], pts, step)
+        if began:
+            row["change_began"] = began
+        series.append(row)
     out = {"window_minutes": minutes_back, "step_seconds": step, "series": series}
     if not series:
         out["note"] = "No series matched. A label name or value is probably wrong; real labels are below."
         out["labels_seen_last_6h"] = _label_hint(promql)
+    return out
+
+
+def _range(promql: str, minutes_back: int, end: float | None = None) -> tuple[list[dict], int]:
+    """Samples for every series over a window. Up to 240 steps, so a wide window
+    still shows the shape of a change instead of one or two points."""
+    end = end or time.time()
+    start = end - minutes_back * 60
+    step = max(15, int(minutes_back * 60 / 240))
+    data = _prom("/api/v1/query_range", {"query": promql, "start": start, "end": end, "step": step})
+    out = []
+    for s in data["result"]:
+        pts = [(float(t), float(v)) for t, v in s["values"] if v not in ("NaN", "+Inf", "-Inf")]
+        if pts:
+            out.append({"labels": {k: v for k, v in s["metric"].items() if k != "__name__"}, "pts": pts})
+    return out, step
+
+
+def _last_level_index(pts: list, base: float, tol: float) -> int | None:
+    """Index of the last sample still at the starting level, if the series ends away from it."""
+    if abs(pts[-1][1] - base) <= tol:
+        return None
+    idx = 0
+    for i, (_, v) in enumerate(pts):
+        if abs(v - base) <= tol:
+            idx = i
+    return idx
+
+
+def _change_began(promql: str, labels: dict, pts: list, step: int) -> str | None:
+    """When a series left its starting level for good: the last sample that was still
+    within 10% of the total swing from where the window started. With a coarse step,
+    the neighbourhood is queried again at 15 s to pin the time down."""
+    values = [v for _, v in pts]
+    span = max(values) - min(values)
+    if len(pts) < 3 or span <= 0 or span < 0.02 * max(abs(max(values)), abs(min(values)), 1e-9):
+        return None
+    base, tol = pts[0][1], 0.10 * span
+    idx = _last_level_index(pts, base, tol)
+    if idx is None:
+        return None
+    t = pts[idx][0]
+    if step > 15:
+        try:
+            fine = _prom("/api/v1/query_range", {"query": promql, "start": t - step, "end": t + 2 * step, "step": 15})
+            for s in fine["result"]:
+                if {k: v for k, v in s["metric"].items() if k != "__name__"} == labels:
+                    fpts = [(float(a), float(b)) for a, b in s["values"] if b not in ("NaN", "+Inf", "-Inf")]
+                    fidx = _last_level_index(fpts, base, tol) if fpts else None
+                    if fidx is not None:
+                        t = fpts[fidx][0]
+        except Exception:
+            pass
+    return f"{_iso(t)} (last sample at the starting level of {round(base, 3)}; it moved away after this and did not return)"
+
+
+def _disk_rules(host: str, mountpoint: str) -> dict:
+    return ((CONFIG.get("disk_accounting") or {}).get(host) or {}).get(mountpoint) or {}
+
+
+def disk_usage_breakdown(host: str, mountpoint: str, minutes_back: int = 60) -> dict:
+    """How much a filesystem grew over a window, and how much of that growth the
+    measured consumers on it account for. The remainder is reported, not explained away."""
+    mb = 1e6
+    end = time.time()
+    start = end - minutes_back * 60
+    sel = f'instance="{host}",mountpoint="{mountpoint}"'
+    fs_q = f"node_filesystem_size_bytes{{{sel}}} - node_filesystem_avail_bytes{{{sel}}}"
+    fs, step = _range(fs_q, minutes_back, end)
+    if not fs:
+        return {"host": host, "mountpoint": mountpoint,
+                "note": "no filesystem metrics matched; check the host and mountpoint against host_health"}
+    pts = fs[0]["pts"]
+    fs_growth = (pts[-1][1] - pts[0][1]) / mb
+    out: dict = {
+        "host": host, "mountpoint": mountpoint, "window_minutes": minutes_back,
+        "filesystem": {
+            "used_mb_at_window_start": [_iso(pts[0][0]), round(pts[0][1] / mb, 1)],
+            "used_mb_now": [_iso(pts[-1][0]), round(pts[-1][1] / mb, 1)],
+            "growth_mb": round(fs_growth, 1),
+            "growth_began": _change_began(fs_q, fs[0]["labels"], pts, step),
+        },
+    }
+    rules = _disk_rules(host, mountpoint)
+    measured_total, groups = 0.0, []
+    for rule in rules.get("measured", []):
+        try:
+            rows, rstep = _range(rule["promql"], minutes_back, end)
+        except Exception as exc:
+            groups.append({"name": rule["name"], "error": str(exc)})
+            continue
+        items, total = [], 0.0
+        for s in rows:
+            p = s["pts"]
+            new = p[0][0] > start + 2 * rstep        # first appeared inside the window: it started from nothing
+            first = 0.0 if new else p[0][1]
+            growth = (p[-1][1] - first) / mb
+            total += growth
+            item = {"labels": {k: v for k, v in s["labels"].items() if k in rule.get("labels", [])},
+                    "mb_at_window_start": round(first / mb, 1), "mb_last": round(p[-1][1] / mb, 1),
+                    "growth_mb": round(growth, 1), "last_sample_utc": _iso(p[-1][0])}
+            if new:
+                item["first_seen_utc"] = _iso(p[0][0]) + " (did not exist earlier in this window)"
+            if end - p[-1][0] > max(90, 2 * rstep):
+                item["stale"] = "stopped reporting at " + _iso(p[-1][0]) + "; growth after that is not counted"
+            items.append(item)
+        items.sort(key=lambda i: -abs(i["growth_mb"]))
+        group = {"name": rule["name"], "growth_mb": round(total, 1), "largest_movers": items[:8]}
+        if rule.get("detail_only"):
+            group["note"] = "a finer view of a group above; not added to the total again"
+        else:
+            measured_total += total
+        groups.append(group)
+    out["measured_consumers"] = groups
+    unexplained = fs_growth - measured_total
+    out["measured_growth_mb"] = round(measured_total, 1)
+    out["unexplained_growth_mb"] = round(unexplained, 1)
+    if fs_growth > 1:
+        out["unexplained_share_percent"] = round(100 * unexplained / fs_growth)
+    writers = []
+    for name in rules.get("unmeasured_writers", []):
+        try:
+            writers.append({"service": name, "role": _service_entry(name).get("role", "")})
+        except ValueError:
+            writers.append({"service": name})
+    out["writers_with_no_size_metric"] = writers
+    out["how_to_read"] = (
+        "unexplained_growth_mb is filesystem growth that no size metric accounts for. It can only come from the "
+        "writers listed without a size metric, or from something that leaves no trace here. Read those writers' "
+        "logs and add up what they say they wrote and kept in this window. If that does not come close to the "
+        "unexplained growth, the cause is not visible in metrics or logs: say so instead of naming a suspect."
+        if rules else
+        "No consumers are configured for this mountpoint, so nothing here is accounted for.")
     return out
 
 
@@ -330,7 +465,19 @@ def list_deploys(service: str, hours_back: int = 24) -> dict:
         raise RuntimeError(f"Jenkins error {r.status_code}")
     cutoff = time.time() - hours_back * 3600
     inside, before = [], None
-    for b in r.json().get("builds", []):
+    builds = r.json().get("builds", [])
+    # When each successful build was live: from its finish until the next successful build finished.
+    live: dict[int, tuple] = {}
+    prev = None
+    for b in sorted(builds, key=lambda x: x["timestamp"]):
+        if b.get("building") or b.get("result") != "SUCCESS":
+            continue
+        done = (b["timestamp"] + b.get("duration", 0)) / 1000
+        if prev is not None:
+            live[prev] = (live[prev][0], done)
+        live[b["number"]] = (done, None)
+        prev = b["number"]
+    for b in builds:
         started = b["timestamp"] / 1000
         desc = (b.get("description") or "").split(" ", 1)
         ref = next((p["value"] for a in b.get("actions", []) for p in a.get("parameters", []) if p.get("name") == "REF"), "")
@@ -343,12 +490,21 @@ def list_deploys(service: str, hours_back: int = 24) -> dict:
             "commit_subject": desc[1] if len(desc) > 1 else None,
             "requested_ref": ref,
         }
+        if b["number"] in live:
+            went, replaced = live[b["number"]]
+            row["went_live_utc"] = _iso(went)
+            row["replaced_utc"] = _iso(replaced) if replaced else None
+            row["status_now"] = "replaced by a later deploy" if replaced else "latest successful deploy"
         if started >= cutoff:
             inside.append(row)
         elif before is None:
             before = row
     return {"service": service, "job": job, "window_hours": hours_back,
-            "deploys_newest_first": inside, "last_deploy_before_window": before}
+            "deploys_newest_first": inside, "last_deploy_before_window": before,
+            "how_to_read": ("A deploy can only have caused a problem that began while it was live "
+                            "(between went_live_utc and replaced_utc). One replaced before the problem began "
+                            "was not running. A FAILED build has no live window here but may still have "
+                            "changed what is running: check the running version and the service's own logs.")}
 
 
 def get_diff(service: str, commit: str, base: str = "") -> dict:
@@ -375,11 +531,41 @@ def get_diff(service: str, commit: str, base: str = "") -> dict:
     }
 
 
+def _brief_changes(name: str, entry: dict, minutes_back: int) -> dict:
+    """Short version of what_changed for a neighbouring service: deploys and rare log kinds."""
+    brief: dict = {"service": name, "role": entry.get("role", "")}
+    if entry.get("deploy_job"):
+        try:
+            cutoff = time.time() - minutes_back * 60
+            d = list_deploys(name, hours_back=max(1, -(-minutes_back // 60)))
+            brief["deploys_in_window"] = [
+                x for x in d.get("deploys_newest_first", [])
+                if datetime.strptime(x["started_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() >= cutoff]
+        except Exception as exc:
+            brief["deploys_in_window"] = f"unavailable: {exc}"
+    try:
+        kinds = log_summary(name, minutes_back).get("kinds_rarest_first", [])[:5]
+        for k in kinds:
+            k["first_seen"] = str(k.get("first_seen", ""))[:260]
+        brief["log_kinds_rarest_first"] = kinds
+    except Exception as exc:
+        brief["log_kinds_rarest_first"] = f"unavailable: {exc}"
+    return brief
+
+
 def what_changed(service: str, minutes_back: int = 120) -> dict:
     """Everything that changed for one service in a window: deploys, restarts, new kinds of log line."""
     entry = _service_entry(service)
     out: dict = {"service": service, "window_minutes": minutes_back, "now_utc": _iso(time.time()),
                  "depends_on": entry.get("depends_on", [])}
+    # Services that call or write to this one. A change in one of them is often the cause
+    # of a problem that shows up here, so their changes are included in brief.
+    used_by = []
+    for host in CONFIG["service_map"].values():
+        for name, other in host.get("services", {}).items():
+            if name != service and service in other.get("depends_on", []):
+                used_by.append(_brief_changes(name, other, minutes_back))
+    out["used_by"] = used_by or "no service is recorded as depending on this one"
     try:
         d = list_deploys(service, hours_back=max(1, -(-minutes_back // 60)))
         cutoff = time.time() - minutes_back * 60
@@ -457,17 +643,22 @@ TOOLS: dict[str, dict] = {
     },
     "query_metrics": {
         "fn": query_metrics,
-        "description": "Run a PromQL query. minutes_back=0 returns current values. minutes_back>0 returns the trend over that window per series (first, last, min, max and sampled points with UTC times), which is how you find when something started changing.",
+        "description": "Run a PromQL query. minutes_back=0 returns current values. minutes_back>0 returns the trend over that window per series (first, last, min, max, sampled points with UTC times, and change_began: when the series left its starting level), which is how you find when something started changing. Series that moved most come first. Start with a window of about 60 minutes and widen only if the change began before it.",
         "parameters": _schema({"promql": _S, "minutes_back": {**_I, "description": "0 for now, or window size in minutes"}}, ["promql"]),
+    },
+    "disk_usage_breakdown": {
+        "fn": disk_usage_breakdown,
+        "description": "For a filling disk: how much the filesystem grew over a window and when the growth began, how much of that growth each measured consumer on it accounts for (for example each database and collection), and how much growth is left unexplained. Use it to check that a suspect really accounts for the size of the growth before naming it as the cause.",
+        "parameters": _schema({"host": _S, "mountpoint": _S, "minutes_back": _I}, ["host", "mountpoint"]),
     },
     "what_changed": {
         "fn": what_changed,
-        "description": "Everything that changed for one service in a time window, in one call: deploys (from Jenkins), restarts, whether its scrape target was up, which version was running, and the rarest kinds of log line with their first occurrence. Call this early for the affected service and for the services it depends on or that depend on it.",
+        "description": "Everything that changed for one service in a time window, in one call: deploys (from Jenkins), restarts, whether its scrape target was up, which version was running, and the rarest kinds of log line with their first occurrence. Also includes, in brief, the deploys and rare log lines of the services that call or write to it (used_by). Call this early for the affected service.",
         "parameters": _schema({"service": _S, "minutes_back": _I}, ["service"]),
     },
     "list_deploys": {
         "fn": list_deploys,
-        "description": "Deploy history for a service from its Jenkins job, newest first: build number, start and finish time (UTC), result, commit and commit subject. Also returns the last deploy before the window, which is the version to roll back to.",
+        "description": "Deploy history for a service from its Jenkins job, newest first: build number, start and finish time (UTC), result, commit and commit subject, and for each successful build when it went live and when a later deploy replaced it. Also returns the last deploy before the window, which is the version to roll back to.",
         "parameters": _schema({"service": _S, "hours_back": _I}, ["service"]),
     },
     "get_diff": {
