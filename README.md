@@ -4,6 +4,8 @@ An agent that picks up a generic monitoring alert and works out why it fired.
 
 Most alerting tells you a symptom: "disk almost full", "instance not responding". Someone on call then spends twenty minutes in Grafana, Loki, Jenkins and the git host figuring out the cause. This project does that digging automatically and posts the answer under the alert in Slack, with evidence and a proposed fix. It is read-only: it proposes, a person decides.
 
+It started as an MCP server, which is where the name comes from: read-only tools for Prometheus, Loki, Jenkins and Bitbucket that an agent like Claude Code could use to investigate. But an MCP server only answers when someone asks it something, and when an alert fires nobody is asking yet. So I built an agent on top of the same tools that starts on its own when the alert comes in. The MCP server is still here, and Claude Code can use the same tools through it when you want to dig in yourself.
+
 I built it against a small replica of a real EC2 stack, with failures I plant on purpose so I can score whether the agent gets them right.
 
 ## Demo
