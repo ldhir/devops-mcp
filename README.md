@@ -99,6 +99,7 @@ sequenceDiagram
 | `list_deploys` | Deploy history for a service | Jenkins |
 | `get_diff` | What a commit changed | Bitbucket |
 | `what_changed` | Deploys, restarts and new kinds of log line for a service, in one call | all of the above |
+| `alert_coverage` | Why no alert fired for a host: is it scraped, which rules track it, paused, silenced, where notifications go. Follow-ups and MCP only | Grafana, Prometheus |
 | `post_update` | Post to the alerts channel | Slack |
 
 Three of these exist because the agent failed without them. In early runs it missed a single config-change log line buried under thousands of routine request lines, so `log_summary` now surfaces rare lines first. It also guessed a metric label wrong and read the empty result as "no data", so empty results now come back with the label names that do exist. And in the first eval pass it kept blaming a backup job for disk growth the job could not have produced, so `disk_usage_breakdown` now puts the numbers side by side: how much the disk grew, how much each database and collection grew, and how much is left unexplained.
@@ -289,10 +290,11 @@ The lab is a stand-in. To point the agent at a real environment you change one c
 | `OPENAI_API_KEY` | model API key | |
 | `JENKINS_USER`, `JENKINS_PASSWORD` | a Jenkins user for the agent | read only; it should get a 403 on build |
 | `BITBUCKET_TOKEN` | repository access token | repository read |
+| `GRAFANA_TOKEN` | Grafana service account token (optional) | Viewer role; only for `alert_coverage` ("why did no alert fire for this host") |
 
 **3. Describe your environment in `agent/config.yaml`:**
 
-- `sources`: the URLs of Prometheus, Loki and Jenkins.
+- `sources`: the URLs of Prometheus, Loki and Jenkins, and optionally Grafana.
 - `service_map`: for each host, its services. For each service: what it does (`role`), what it calls (`depends_on`), its Prometheus job (`metrics_job`), its Jenkins deploy job (`deploy_job`) and its repository (`repo`). This is how the agent turns "disk full on host X" into a service, and how it knows who writes to what.
 - `disk_accounting`: for each disk worth explaining, the size metrics of what lives on it and the services that write there with no size metric. `disk_usage_breakdown` uses this to say how much growth is accounted for.
 - `slack.channel`, and `prices` for the model you use.
@@ -315,7 +317,7 @@ What the code assumes today, so you know what would need changing:
 
 ## Using Claude Code
 
-There are two ways to use Claude Code with this, and neither needs an OpenAI key. Both go through the MCP server, so the tool allowlist, the masking and the audit log are the same as in the alert runner. The MCP server offers the ten read tools and does not offer posting to Slack.
+There are two ways to use Claude Code with this, and neither needs an OpenAI key. Both go through the MCP server, so the tool allowlist, the masking and the audit log are the same as in the alert runner. The MCP server offers the eleven read tools and does not offer posting to Slack.
 
 **Ask questions from Claude Code.** Register the server once. If Claude Code runs on the same machine as the agent:
 

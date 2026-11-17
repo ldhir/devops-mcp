@@ -22,6 +22,7 @@ CONFIG = yaml.safe_load((HERE / "config.yaml").read_text())
 PROM = CONFIG["sources"]["prometheus"]
 LOKI = CONFIG["sources"]["loki"]
 JENKINS = CONFIG["sources"].get("jenkins", "")
+GRAFANA = (CONFIG["sources"].get("grafana") or "").rstrip("/")
 AUDIT_PATH = HERE / CONFIG.get("audit_log", "audit.jsonl")
 MAX_RESULT_CHARS = 7000
 
@@ -598,6 +599,235 @@ def what_changed(service: str, minutes_back: int = 120) -> dict:
         out["log_kinds_rarest_first"] = f"unavailable: {exc}"
     return out
 
+# ------------------------------------------------------- alert coverage (Grafana)
+
+def _grafana(path: str) -> object:
+    """GET from Grafana's HTTP API with the agent's read-only service account token."""
+    token = os.environ.get("GRAFANA_TOKEN", "")
+    if not GRAFANA or not token:
+        raise RuntimeError("Grafana is not configured: set sources.grafana in config.yaml and GRAFANA_TOKEN in .env")
+    r = httpx.get(f"{GRAFANA}{path}", headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    if r.status_code == 401:
+        raise RuntimeError(f"Grafana rejected the token on {path} (401): GRAFANA_TOKEN is wrong or expired")
+    if r.status_code == 403:
+        raise RuntimeError(f"Grafana refused {path} (403): the token's role cannot read this")
+    r.raise_for_status()
+    return r.json()
+
+
+def _mentions(labels: dict, needle: str) -> bool:
+    return any(needle in str(v).lower() for v in (labels or {}).values())
+
+
+def _rule_condition(data: list, condition: str) -> str:
+    """Describe the threshold step of a Grafana rule, e.g. 'A gt 85'."""
+    for step in data or []:
+        if step.get("refId") != condition:
+            continue
+        model = step.get("model") or {}
+        parts = []
+        for c in model.get("conditions") or []:
+            ev = c.get("evaluator") or {}
+            ref = model.get("expression") or ((c.get("query") or {}).get("params") or ["?"])[0]
+            parts.append(f"{ref} {ev.get('type', '?')} {' '.join(str(x) for x in ev.get('params', []))}".strip())
+        return "; ".join(parts) or f"{model.get('type', 'expression')}: {model.get('expression', '')}"
+    return ""
+
+
+def _silence_matches(matchers: list, labels: dict) -> bool:
+    for m in matchers or []:
+        value = str(labels.get(m.get("name", ""), ""))
+        hit = bool(re.fullmatch(m.get("value", ""), value)) if m.get("isRegex") else value == m.get("value", "")
+        if hit != m.get("isEqual", True):
+            return False
+    return True
+
+
+def _routes(route: dict, depth: int = 0) -> list[dict]:
+    """Flatten the notification policy tree: which labels go to which receiver."""
+    out = []
+    for child in (route.get("routes") or [])[:20]:
+        row = {
+            "depth": depth + 1,
+            "matchers": child.get("object_matchers") or child.get("matchers") or child.get("match") or [],
+            "receiver": child.get("receiver") or "(inherits parent)",
+        }
+        if child.get("mute_time_intervals"):
+            row["mute_time_intervals"] = child["mute_time_intervals"]
+        if child.get("continue"):
+            row["continue"] = True
+        out.append(row)
+        if depth < 2:
+            out.extend(_routes(child, depth + 1))
+    return out
+
+
+def alert_coverage(instance: str, alert_name: str = "") -> dict:
+    """Why did (or didn't) an alert fire for this instance. Read-only."""
+    needle = instance.strip().lower()
+    if not needle:
+        raise ValueError("instance is required")
+    want = alert_name.strip().lower()
+    out: dict = {"instance": instance, "now_utc": _iso(time.time())}
+    errors: dict = {}
+
+    # 1. Is Prometheus scraping it at all? A rule cannot fire on a host it has no data for.
+    try:
+        targets = _prom("/api/v1/targets", {"state": "active"}).get("activeTargets", [])
+        mine = [t for t in targets if _mentions(t.get("labels"), needle) or needle in t.get("scrapeUrl", "").lower()]
+        out["scrape_targets"] = [
+            {"job": t["labels"].get("job"), "instance": t["labels"].get("instance"), "health": t.get("health"),
+             "last_scrape": (t.get("lastScrape") or "")[:19] + "Z", "last_error": t.get("lastError") or ""}
+            for t in mine[:15]
+        ]
+        if not mine:
+            known = sorted({t["labels"].get("instance", "") for t in targets})
+            out["scrape_targets_note"] = (
+                "Prometheus has no scrape target matching this name, so no rule that queries Prometheus can see "
+                "it. Check the spelling against the instance labels it does scrape.")
+            out["instances_prometheus_scrapes"] = known[:40]
+    except Exception as exc:
+        errors["scrape_targets"] = str(exc)
+
+    # 2. Rule definitions (paused, no-data handling, query) and their current state per series.
+    definitions: dict = {}
+    try:
+        for folder, groups in _grafana("/api/ruler/grafana/api/v1/rules").items():
+            for g in groups:
+                for r in g.get("rules", []):
+                    ga = r.get("grafana_alert") or {}
+                    definitions[(folder, g.get("name"), ga.get("title"))] = {"for": r.get("for"), **ga}
+    except Exception as exc:
+        errors["rule_definitions"] = str(exc)
+
+    covering, not_covering, alert_labels, total = [], [], [], 0
+    try:
+        groups = _grafana("/api/prometheus/grafana/api/v1/rules")["data"]["groups"]
+        for g in groups:
+            for r in g.get("rules", []):
+                if r.get("type") == "recording" or (want and want not in r.get("name", "").lower()):
+                    continue
+                total += 1
+                d = definitions.get((g.get("file"), g.get("name"), r.get("name")), {})
+                row = {
+                    "rule": r.get("name"),
+                    "folder_group": f"{g.get('file')}/{g.get('name')}",
+                    "paused": d.get("is_paused"),
+                    "fires_after": d.get("for") or f"{r.get('duration', 0)}s",
+                    "condition": _rule_condition(d.get("data"), d.get("condition", "")),
+                    "query": (r.get("query") or "")[:300],
+                    "when_query_returns_no_data": d.get("no_data_state"),
+                    "when_query_errors": d.get("exec_err_state"),
+                    "health": r.get("health"),
+                    "last_evaluation": (r.get("lastEvaluation") or "")[:19] + "Z",
+                }
+                if r.get("lastError"):
+                    row["last_error"] = r["lastError"][:300]
+                mine = [a for a in r.get("alerts") or [] if _mentions(a.get("labels"), needle)]
+                if mine:
+                    # Count the quiet series; spell out only the ones that are not Normal.
+                    states: dict = {}
+                    for a in mine:
+                        states[a.get("state")] = states.get(a.get("state"), 0) + 1
+                    row["series_for_this_instance"] = states
+                    loud = [a for a in mine if a.get("state") != "Normal"]
+                    if loud:
+                        row["not_normal"] = [
+                            {"state": a.get("state"), "since": (a.get("activeAt") or "")[:19] + "Z",
+                             "labels": {k: v for k, v in a["labels"].items()
+                                        if k not in ("alertname", "grafana_folder", "__name__")}}
+                            for a in loud[:8]
+                        ]
+                    alert_labels.extend(a["labels"] for a in mine)
+                    covering.append(row)
+                else:
+                    row["series_for_other_instances"] = len(r.get("alerts") or [])
+                    not_covering.append(row)
+    except Exception as exc:
+        errors["rule_state"] = str(exc)
+
+    # For rules with no series for this instance, run the rule's own query to see why.
+    # Only the first Prometheus query of each rule is run, and against this agent's Prometheus.
+    for row in not_covering[:12]:
+        try:
+            series = _prom("/api/v1/query", {"query": row["query"]})["result"]
+            hits = sum(1 for s in series if _mentions(s.get("metric"), needle))
+            if not series:
+                row["query_check"] = "the query returns no series at all right now"
+            elif hits:
+                row["query_check"] = (f"the query returns {hits} series for this instance right now, but the rule "
+                                      "holds no state for them yet (new series, or the rule has not evaluated since)")
+            else:
+                row["query_check"] = (f"the query returns {len(series)} series, none for this instance: "
+                                      "its labels do not match the query, or it reports no such metric")
+        except Exception as exc:
+            row["query_check"] = f"could not run the query here: {str(exc)[:160]}"
+    # With many rules, shorten the unremarkable ones so the result fits; alert_name gives full detail.
+    if total > 8:
+        for i, row in enumerate(covering):
+            if not row.get("paused") and row.get("health") == "ok" and "not_normal" not in row:
+                covering[i] = {k: row[k] for k in ("rule", "condition", "fires_after", "series_for_this_instance")}
+        for i, row in enumerate(not_covering):
+            if not row.get("paused") and row.get("health") == "ok":
+                not_covering[i] = {k: row[k] for k in ("rule", "condition", "query", "query_check") if k in row}
+                not_covering[i]["query"] = not_covering[i]["query"][:120]
+        out["rules_note"] = "Healthy, unpaused rules are shortened. Pass alert_name for one rule's full detail."
+    out["rules_checked"] = total
+    out["rules_tracking_this_instance"] = covering
+    out["rules_not_tracking_this_instance"] = not_covering[:12]
+    if len(not_covering) > 12:
+        out["rules_not_tracking_this_instance_omitted"] = len(not_covering) - 12
+    if want and not total:
+        out["rules_note"] = f"no Grafana alert rule has a name containing '{alert_name}'"
+
+    # 3. Firing but quiet: silences, suppressed notifications, where notifications are routed.
+    try:
+        active = [s for s in _grafana("/api/alertmanager/grafana/api/v2/silences")
+                  if (s.get("status") or {}).get("state") == "active"]
+        out["active_silences"] = [
+            {"matchers": [f"{m['name']}{'=' if m.get('isEqual', True) else '!='}{'~' if m.get('isRegex') else ''}{m['value']}"
+                          for m in s.get("matchers", [])],
+             "by": s.get("createdBy"), "comment": s.get("comment"), "ends": (s.get("endsAt") or "")[:19] + "Z",
+             "silences_this_instance": any(_silence_matches(s.get("matchers"), lb) for lb in alert_labels)}
+            for s in active[:20]
+        ]
+    except Exception as exc:
+        errors["silences"] = str(exc)
+    try:
+        sent = [a for a in _grafana("/api/alertmanager/grafana/api/v2/alerts") if _mentions(a.get("labels"), needle)]
+        out["notifications_for_this_instance"] = [
+            {"alert": a["labels"].get("alertname"), "state": (a.get("status") or {}).get("state"),
+             "silenced_by": (a.get("status") or {}).get("silencedBy") or [],
+             "inhibited_by": (a.get("status") or {}).get("inhibitedBy") or [],
+             "receivers": [x.get("name") for x in a.get("receivers") or []],
+             "since": (a.get("startsAt") or "")[:19] + "Z"}
+            for a in sent[:12]
+        ]
+    except Exception as exc:
+        errors["notifications"] = str(exc)
+    try:
+        policy = _grafana("/api/v1/provisioning/policies")
+        out["notification_routing"] = {"default_receiver": policy.get("receiver"), "routes": _routes(policy)}
+    except Exception as exc:
+        errors["notification_routing"] = str(exc)
+
+    # 4. Rules that live in Prometheus rule files instead of Grafana.
+    try:
+        prom_rules = [r for g in _prom("/api/v1/rules", {"type": "alert"}).get("groups", []) for r in g.get("rules", [])
+                      if not want or want in r.get("name", "").lower()]
+        out["prometheus_rule_file_alerts"] = [
+            {"rule": r.get("name"), "state": r.get("state"), "health": r.get("health"), "query": (r.get("query") or "")[:300],
+             "series_for_this_instance": [{"state": a.get("state"), "since": a.get("activeAt")}
+                                          for a in r.get("alerts") or [] if _mentions(a.get("labels"), needle)]}
+            for r in prom_rules[:25]
+        ]
+    except Exception as exc:
+        errors["prometheus_rule_file_alerts"] = str(exc)
+
+    if errors:
+        out["could_not_read"] = errors
+    return out
+
 
 def post_update(text: str, thread_ts: str = "") -> dict:
     """Post a message to the configured Slack channel. The only tool that writes anywhere."""
@@ -686,6 +916,12 @@ TOOLS: dict[str, dict] = {
             },
             [],
         ),
+    },
+    "alert_coverage": {
+        "fn": alert_coverage,
+        "ask_only": True,  # for questions from people; the alert runner does not get it (see runner.py)
+        "description": "For questions like 'why is no alert firing for host X' or 'why did nobody get notified'. In one call, for one instance: whether Prometheus scrapes it and the scrape is healthy; every Grafana alert rule with its query, threshold, wait time, paused flag, no-data and error handling, health and last evaluation; the state of each series the rule tracks for this instance; for rules that track nothing for it, whether the rule's query returns this instance at all; active silences and whether they match; notifications in flight and where they are routed. instance is matched as a case-insensitive substring of label values. alert_name optionally narrows to rules whose name contains it.",
+        "parameters": _schema({"instance": {**_S, "description": "Host or instance name as it appears in labels"}, "alert_name": {**_S, "description": "optional: part of a rule name"}}, ["instance"]),
     },
     "post_update": {
         "fn": post_update,

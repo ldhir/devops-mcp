@@ -33,11 +33,18 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url=MODEL.get("base_u
 
 # The model investigates with read tools only. Posting to Slack is done by
 # this code, so the model cannot post anything except its final write-up.
-AGENT_TOOLS = [
-    {"type": "function", "function": {"name": n, "description": s["description"], "parameters": s["parameters"]}}
-    for n, s in TOOLS.items()
-    if n != "post_update"
-]
+def _specs(include_ask_only: bool) -> list:
+    return [
+        {"type": "function", "function": {"name": n, "description": s["description"], "parameters": s["parameters"]}}
+        for n, s in TOOLS.items()
+        if n != "post_update" and (include_ask_only or not s.get("ask_only"))
+    ]
+
+
+# An alert investigation gets the tool set the evals were run on. Tools marked ask_only answer
+# questions a person asks (for example "why did no alert fire"), so only follow-ups get them.
+AGENT_TOOLS = _specs(include_ask_only=False)
+FOLLOWUP_TOOLS = _specs(include_ask_only=True)
 
 
 def cost_usd(usage: dict, model: str) -> float | None:
@@ -269,7 +276,7 @@ _lock = threading.Lock()
 @app.on_event("startup")
 def start_followups() -> None:
     try:
-        followup.start(client, AGENT_TOOLS)
+        followup.start(client, FOLLOWUP_TOOLS)
     except Exception:
         log.exception("could not start follow-up listener")
 
