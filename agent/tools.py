@@ -62,8 +62,31 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _login(prefix: str) -> dict:
+    """Optional login for Prometheus or Loki, from .env. Returns extra arguments for httpx.
+
+    PROMETHEUS_TOKEN / LOKI_TOKEN            sent as a bearer token
+    PROMETHEUS_USER + PROMETHEUS_PASSWORD    basic auth (same for LOKI_)
+    LOKI_TENANT                              X-Scope-OrgID header, for multi-tenant Loki
+    With none of these set, the request is sent without a login, as in the lab.
+    """
+    kw: dict = {}
+    headers = {}
+    if os.environ.get(f"{prefix}_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ[f'{prefix}_TOKEN']}"
+    elif os.environ.get(f"{prefix}_USER"):
+        kw["auth"] = (os.environ[f"{prefix}_USER"], os.environ.get(f"{prefix}_PASSWORD", ""))
+    if os.environ.get(f"{prefix}_TENANT"):
+        headers["X-Scope-OrgID"] = os.environ[f"{prefix}_TENANT"]
+    if headers:
+        kw["headers"] = headers
+    return kw
+
+
 def _prom(path: str, params: dict) -> dict:
-    r = httpx.get(f"{PROM}{path}", params=params, timeout=20)
+    r = httpx.get(f"{PROM}{path}", params=params, timeout=20, **_login("PROMETHEUS"))
+    if r.status_code in (401, 403):
+        raise RuntimeError(f"Prometheus refused the request ({r.status_code}): check PROMETHEUS_TOKEN or PROMETHEUS_USER/PASSWORD in .env")
     body = r.json()
     if body.get("status") != "success":
         raise RuntimeError(f"Prometheus error: {body.get('error', r.text[:300])}")
@@ -322,7 +345,7 @@ def log_summary(service: str, minutes_back: int = 60) -> dict:
     selector = f'{{service="{service}"}}'
 
     def loki(path: str, params: dict) -> list:
-        r = httpx.get(f"{LOKI}{path}", params=params, timeout=30)
+        r = httpx.get(f"{LOKI}{path}", params=params, timeout=30, **_login("LOKI"))
         if r.status_code != 200:
             raise RuntimeError(f"Loki error {r.status_code}: {r.text[:300]}")
         return r.json()["data"]["result"]
@@ -419,6 +442,7 @@ def get_logs(
     end = time.time()
     r = httpx.get(
         f"{LOKI}/loki/api/v1/query_range",
+        **_login("LOKI"),
         params={
             "query": logql,
             "start": int((end - minutes_back * 60) * 1e9),

@@ -309,7 +309,7 @@ What the code assumes today, so you know what would need changing:
 
 - Logs are in Loki with a `service` label that matches the names in `service_map`.
 - Hosts run node_exporter, and `instance` in Prometheus is the host name used in `service_map`.
-- Prometheus and Loki are reachable without a login. Token or basic auth for them is not implemented yet.
+- Prometheus and Loki are reachable from the agent's machine. If they need a login, set `PROMETHEUS_TOKEN` / `LOKI_TOKEN` (bearer) or `PROMETHEUS_USER` + `PROMETHEUS_PASSWORD` / `LOKI_USER` + `LOKI_PASSWORD` (basic auth) in `.env`; `LOKI_TENANT` sets the tenant header. Only the no-login case has been run against a real server.
 - Deploys go through a Jenkins job whose build description is `<commit> <subject>`. `lab/jenkins/jenkins.yaml` shows the job.
 - Code is on Bitbucket Cloud.
 - `what_changed` reports which version was running only for the lab app, through its `orders_build_info` metric. Other services still get deploys, restarts and log changes.
