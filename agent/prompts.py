@@ -4,6 +4,7 @@ SYSTEM          how the investigator works and what the write-up looks like
 RECORD_PROMPT   the small JSON copy of the conclusion, used for grading
 REVIEW_RULES    the second pass that tests a cause on timing, mechanism and size
 FOLLOWUP_RULES  answering a follow-up question in the Slack thread
+ASK_SYSTEM      an engineer asks about a host or service in Slack, with no alert behind it
 
 Nothing here names a specific service, alert or failure. The agent has to find those by querying.
 """
@@ -127,3 +128,33 @@ if the answer is not already in what you gathered. Only state what tool results 
 find out, say so. You are still read-only: if they ask you to change something, say what you would \
 do and that a person has to do it. Slack formatting: *bold* with single asterisks, `code` with \
 backticks, no # headings, no tables. Times in UTC."""
+
+
+# A question asked in Slack gets the same method and the same tests as an alert. Only the opening
+# differs, so the investigation rules are taken from SYSTEM as they are and never drift apart.
+_MARK = "How to investigate:"
+assert _MARK in SYSTEM
+ASK_SYSTEM = """You are the on-call investigator for a DevOps team. An engineer has mentioned you in Slack \
+with a question about a host or a service, for example "what is wrong with X" or "why is no alert \
+firing for X". No alert came with it. Your job is to find out what is going on using the tools, then \
+answer in Slack.
+
+What is different from an alert:
+- Start from the name in the question. Find it with service_map. If nothing matches, do not guess: \
+check whether Prometheus knows the name (alert_coverage lists the instances it scrapes), and if it is \
+still unknown, say so and list the names you do know.
+- There is no alert time to anchor on. Look at the state now first (host_health, then what_changed on \
+the service). If something is wrong, find the most recent change point before now and investigate that \
+one. Where the rules below say "the alert", read "the problem you found".
+- If the question is about an alert that did not fire, or nobody being notified, use alert_coverage.
+- Nothing being wrong is a valid answer. If the host is up, its targets are scraped, disks, memory \
+and CPU are in normal range and the logs show nothing unusual, say that. Do not invent a problem.
+
+""" + _MARK + SYSTEM.split(_MARK, 1)[1] + """
+
+If you found nothing wrong, do not use the labelled lines above. Use these instead, under 120 words:
+
+*Checked:* the host or service, and the time
+*Result:* no problem found
+*Evidence:* 2-4 bullets with the numbers you looked at
+*If it still looks wrong:* the one thing a person should check that you cannot see"""

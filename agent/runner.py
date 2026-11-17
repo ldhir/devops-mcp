@@ -5,6 +5,9 @@ For each firing alert:
   2. let the model investigate with the read-only tools,
   3. post its findings as a reply in that thread.
 
+A person can also start one: mention the bot in Slack with a question about a host or
+service and it investigates the same way and replies under the question (see ask()).
+
 Run:  .venv/bin/uvicorn runner:app --host 0.0.0.0 --port 8088
 """
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -20,7 +24,7 @@ from fastapi import FastAPI, Request
 from openai import OpenAI
 
 import followup
-from prompts import RECORD_PROMPT, REVIEW_RULES, SYSTEM
+from prompts import ASK_SYSTEM, RECORD_PROMPT, REVIEW_RULES, SYSTEM
 from tools import CONFIG, HERE, TOOLS, call_tool, post_update, redact
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -268,6 +272,54 @@ def investigate(alert: dict) -> None:
                 pass
 
 
+def ask(event: dict) -> None:
+    """A question asked by mentioning the bot, with no alert behind it. Same tools plus
+    alert_coverage, same second pass, same records; the reply goes under the question."""
+    channel = event.get("channel", "")
+    thread = event.get("thread_ts") or event.get("ts", "")
+    question = redact(re.sub(r"<@[A-Z0-9]+>", "", event.get("text", "")).strip())
+    if not question:
+        followup._reply(channel, thread, "Ask me about a host or service, for example `what is wrong with <host>` "
+                                         "or `why is no alert firing for <host>`.")
+        return
+    model = MODEL["name"]
+    followup._reply(channel, thread, ":mag: Looking into it. This usually takes under a minute.")
+    try:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        messages = [
+            {"role": "system", "content": ASK_SYSTEM},
+            {"role": "user", "content": f"Time now: {now}\nQuestion from an engineer in Slack:\n{question}"},
+        ]
+        started = time.time()
+        usage = {"llm_calls": 0, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        draft, steps, transcript = tool_loop("question", model, messages, FOLLOWUP_TOOLS, set(), usage)
+        # The second pass tests a named cause. An answer that found nothing wrong has none to test.
+        review, flag = None, ""
+        if "*Root cause:*" in draft:
+            _, review, flag = second_pass("question", MODEL.get("review") or "off", model, messages, transcript, draft, usage)
+        seconds = round(time.time() - started, 1)
+        cost = cost_usd(usage, model)
+        footer = f"_{steps} tool calls · {seconds:.0f}s · {usage['input_tokens'] + usage['output_tokens']:,} tokens"
+        footer += f" · ${cost:.2f} · {model}_" if cost is not None else f" · {model}_"
+        followup._reply(channel, thread, draft + ("\n\n" + flag if flag else "") + "\n\n" + footer)
+        try:  # later mentions in this thread become follow-ups with this context
+            followup.save_thread(thread, model, messages)
+        except Exception:
+            log.exception("could not save thread for follow-ups")
+        run_id = f"ask-{thread}"
+        (HERE / "transcripts").mkdir(exist_ok=True)
+        (HERE / "transcripts" / f"{run_id}.json").write_text(json.dumps(transcript))
+        with (HERE / "writeups.jsonl").open("a") as f:
+            f.write(json.dumps({
+                "ts": now, "run_id": run_id, "alert": "question", "question": question, "model": model,
+                "tool_calls": steps, "seconds": seconds, **usage, "cost_usd": cost,
+                "text": draft, "review": review}) + "\n")
+        log.info("question: answered after %d tool calls, %ss, cost %s", steps, seconds, cost)
+    except Exception as exc:
+        log.exception("question failed")
+        followup._reply(channel, thread, f":warning: Could not answer: `{type(exc).__name__}`. See runner logs.")
+
+
 app = FastAPI()
 _seen: dict[str, float] = {}
 _lock = threading.Lock()
@@ -276,7 +328,7 @@ _lock = threading.Lock()
 @app.on_event("startup")
 def start_followups() -> None:
     try:
-        followup.start(client, FOLLOWUP_TOOLS)
+        followup.start(client, FOLLOWUP_TOOLS, ask=ask)
     except Exception:
         log.exception("could not start follow-up listener")
 

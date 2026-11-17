@@ -117,7 +117,9 @@ The same read tools are exposed as an MCP server (`agent/mcp_server.py`), so an 
 
 ## Follow-up questions in Slack
 
-Reply in an alert thread and mention the bot, for example `@alert-agent what else was deployed to orders-api today?`. It loads the investigation for that thread, uses the same read-only tools, and answers in the thread. It only answers when mentioned, and only under its own write-ups.
+Reply in an alert thread and mention the bot, for example `@alert-agent what else was deployed to orders-api today?`. It loads the investigation for that thread, uses the same read-only tools, and answers in the thread. It only answers when mentioned.
+
+You can also ask without an alert. Mention the bot anywhere else, for example `@alert-agent what is wrong with orders-api?` or `@alert-agent why is no alert firing for db-7?`, and it investigates from scratch with the same method and replies under your message: the usual write-up if it finds a problem, a short "no problem found" with the numbers it checked if it does not. Later mentions in that thread are follow-ups. The eval suite only covers alert-triggered runs, so the scorecard below says nothing about this path.
 
 This runs over Slack's Socket Mode (`agent/followup.py`): the machine opens the connection to Slack, so nothing has to be reachable from the internet. It is off unless `SLACK_APP_TOKEN` is set.
 
@@ -273,7 +275,7 @@ cd evals && ~/agent/.venv/bin/python run_evals.py --repeats 3
 ~/agent/.venv/bin/python replay_review.py --infile results.jsonl --mode fresh --out review.jsonl
 ```
 
-For follow-up questions in Slack, turn on Socket Mode for the Slack app, subscribe it to `app_mention`, and put the app-level token in `.env` as `SLACK_APP_TOKEN`.
+For questions and follow-ups in Slack, turn on Socket Mode for the Slack app, subscribe it to `app_mention`, and put the app-level token in `.env` as `SLACK_APP_TOKEN`.
 
 ## Integrating with your own stack
 
@@ -286,7 +288,7 @@ The lab is a stand-in. To point the agent at a real environment you change one c
 | Variable | What it is | Access it needs |
 |---|---|---|
 | `SLACK_BOT_TOKEN` | Slack bot token | `chat:write` in the alerts channel |
-| `SLACK_APP_TOKEN` | Slack app-level token (optional) | `connections:write`, only for follow-up questions |
+| `SLACK_APP_TOKEN` | Slack app-level token (optional) | `connections:write`, for questions and follow-ups asked by mentioning the bot |
 | `OPENAI_API_KEY` | model API key | |
 | `JENKINS_USER`, `JENKINS_PASSWORD` | a Jenkins user for the agent | read only; it should get a 403 on build |
 | `BITBUCKET_TOKEN` | repository access token | repository read |

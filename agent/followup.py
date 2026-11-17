@@ -1,12 +1,15 @@
 """Follow-up questions in Slack.
 
-An engineer replies in an alert thread and mentions the bot. The bot loads the saved
-investigation for that thread, answers with the same read-only tools, and replies in
-the thread. It uses Slack's Socket Mode: this machine opens the connection to Slack,
-so nothing has to be reachable from the internet.
+An engineer mentions the bot. Under one of its own write-ups, that is a follow-up: the bot
+loads the saved investigation for that thread, answers with the same read-only tools, and
+replies in the thread. Anywhere else it is a new question ("what is wrong with host X"),
+which is handed to the runner to investigate from scratch (runner.ask).
+
+It uses Slack's Socket Mode: this machine opens the connection to Slack, so nothing has
+to be reachable from the internet.
 
 Limits, on purpose:
-- It only answers when mentioned, and only in a thread under one of its own write-ups.
+- It only answers when mentioned. It cannot read other messages in the channel.
 - Same tool allowlist, masking and audit log as the alert runner. Still read-only.
 """
 from __future__ import annotations
@@ -88,8 +91,9 @@ def _reply(channel: str, thread_ts: str, text: str) -> None:
         log.error("Slack reply failed: %s", r.json().get("error"))
 
 
-def start(client, tools: list) -> bool:
-    """Open the Socket Mode connection in the background. Returns False if it is not configured."""
+def start(client, tools: list, ask=None) -> bool:
+    """Open the Socket Mode connection in the background. Returns False if it is not configured.
+    'ask' handles a mention that is not under a saved write-up; without it those get a refusal."""
     token = os.environ.get("SLACK_APP_TOKEN", "")
     if not token:
         log.info("SLACK_APP_TOKEN not set; follow-up questions are off")
@@ -111,7 +115,11 @@ def start(client, tools: list) -> bool:
         if key in seen:
             return
         seen.add(key)
-        threading.Thread(target=answer, args=(client, tools, event), daemon=True).start()
+        thread_ts = event.get("thread_ts") or event.get("ts", "")
+        if ask and not (THREADS / f"{thread_ts}.json").exists():
+            threading.Thread(target=ask, args=(event,), daemon=True).start()
+        else:
+            threading.Thread(target=answer, args=(client, tools, event), daemon=True).start()
 
     sm = SocketModeClient(app_token=token)
     sm.socket_mode_request_listeners.append(handle)
